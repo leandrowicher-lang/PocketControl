@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Identificadores encontrados no DJI Mimo 1.3.4 analisado. -->
+    <usb-accessory manufacturer="DJI" model="HG210" />
+</resources>
