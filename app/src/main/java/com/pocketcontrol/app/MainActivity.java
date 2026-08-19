@@ -167,7 +167,7 @@ public class MainActivity extends Activity {
         root.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("Pocket Control 1.2 Raw Stream Sniffer");
+        title.setText("Pocket Control 1.3 LogicLink Video Test");
         title.setTextSize(24f);
         title.setGravity(Gravity.CENTER_HORIZONTAL);
         root.addView(title, new LinearLayout.LayoutParams(
@@ -175,7 +175,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("Analisando todo o stream USB, inclusive bytes fora do DUML");
+        subtitle.setText("Teste direcionado do canal de vídeo DJI LogicLink 0x574A");
         subtitle.setTextSize(15f);
         subtitle.setGravity(Gravity.CENTER_HORIZONTAL);
         subtitle.setPadding(0, dp(6), 0, dp(14));
@@ -241,6 +241,13 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
+        Button logicLinkVideoButton = new Button(this);
+        logicLinkVideoButton.setText("TENTAR CANAL DE VÍDEO 0x574A");
+        logicLinkVideoButton.setOnClickListener(v -> tryLogicLinkVideoService());
+        root.addView(logicLinkVideoButton, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
         LinearLayout modeRow = new LinearLayout(this);
         modeRow.setOrientation(LinearLayout.HORIZONTAL);
 
@@ -288,7 +295,7 @@ public class MainActivity extends Activity {
             }
 
             StringBuilder out = new StringBuilder();
-            out.append("Pocket Control 1.2 Raw Stream Sniffer\n");
+            out.append("Pocket Control 1.3 LogicLink Video Test\n");
             out.append("Android: ").append(Build.VERSION.RELEASE)
                     .append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
             out.append("Aparelho: ").append(Build.MANUFACTURER)
@@ -476,7 +483,7 @@ public class MainActivity extends Activity {
             accessoryOutput = new FileOutputStream(accessoryDescriptor.getFileDescriptor());
 
             appendEvent("Canal USB Accessory aberto. fd=" + accessoryDescriptor.getFd());
-            appendEvent("0.7: nenhum comando é enviado automaticamente. Você pode consultar ou trocar somente o modo FOTO/VÍDEO.");
+            appendEvent("1.3: conexão automática ativa. O teste de vídeo 0x574A só roda ao tocar no botão.");
             statusView.setText("🟢 Osmo detectada — canal aberto");
             refreshUsb();
         } catch (Throwable t) {
@@ -1170,6 +1177,254 @@ public class MainActivity extends Activity {
         }
 
         return s;
+    }
+
+    /**
+     * EXPERIMENTO 1.3:
+     *
+     * O transporte móvel DJI LogicLink usa:
+     *   0x5749 -> canal DUML/controle
+     *   0x574A -> vídeo bruto em equipamentos DJI conhecidos.
+     *
+     * Os dois pacotes abaixo são uma sequência pública de inicialização de
+     * serviço de vídeo observada em equipamentos DJI LogicLink mais novos.
+     * Não é uma sequência confirmada para HG210; por isso só roda quando o
+     * usuário toca no botão e é enviada apenas uma vez.
+     */
+    private synchronized void tryLogicLinkVideoService() {
+        if (listening) {
+            Toast.makeText(this,
+                    "Espere o teste atual terminar.",
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        if (accessoryDescriptor == null || accessoryOutput == null || accessoryInput == null) {
+            autoConnectPocket();
+            if (accessoryDescriptor == null || accessoryOutput == null || accessoryInput == null) {
+                appendEvent("Teste 0x574A cancelado: canal USB indisponível.");
+                return;
+            }
+        }
+
+        final byte[] servicePacket1 = new byte[] {
+                (byte)0x55, (byte)0xCC, (byte)0x49, (byte)0x57,
+                (byte)0x2D, 0x00, 0x00, 0x00,
+                0x55, 0x2D, 0x04, (byte)0xF2, 0x02, 0x28, (byte)0xF3, (byte)0xFE,
+                0x40, 0x00, (byte)0x99,
+                0x02, 0x02, 0x00, 0x00, (byte)0xD5, 0x07, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x13, 0x00, 0x0D, 0x00,
+                0x63, 0x61, 0x6D, 0x63, 0x61, 0x70, 0x5F, 0x63,
+                0x6F, 0x6D, 0x6D, 0x6F, 0x6E, 0x00, 0x00, 0x00,
+                0x00, (byte)0xD0, (byte)0x93,
+                (byte)0x92, 0x3A
+        };
+
+        final byte[] servicePacket2 = new byte[] {
+                (byte)0x55, (byte)0xCC, (byte)0x49, (byte)0x57,
+                0x1B, 0x00, 0x00, 0x00,
+                0x55, 0x1B, 0x04, 0x75, 0x02, 0x3C, (byte)0xF4, (byte)0xFE,
+                0x40, 0x00, (byte)0x88,
+                0x17, 0x00, 0x00, 0x23, 0x00,
+                0x41, 0x50, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x02, 0x58, (byte)0xA6,
+                0x34, 0x18
+        };
+
+        try {
+            accessoryOutput.write(servicePacket1);
+            accessoryOutput.flush();
+
+            try { Thread.sleep(80); } catch (InterruptedException ignored) {}
+
+            accessoryOutput.write(servicePacket2);
+            accessoryOutput.flush();
+
+            appendEvent("LOGICLINK: sequência experimental de serviço enviada uma vez.");
+            appendEvent("Agora procurando especificamente o PORT 0x574A (vídeo).");
+            statusView.setText("🎥 Procurando canal de vídeo 0x574A...");
+
+            listenForLogicLinkVideo(7500L);
+
+        } catch (Throwable t) {
+            appendEvent("Falha ao enviar sequência LogicLink: "
+                    + t.getClass().getSimpleName() + " - " + safe(t.getMessage()));
+            statusView.setText("❌ Falha no teste LogicLink");
+        }
+    }
+
+    private void listenForLogicLinkVideo(final long timeoutMs) {
+        if (listening) return;
+        listening = true;
+
+        listenThread = new Thread(() -> {
+            ByteArrayOutputStream rx = new ByteArrayOutputStream();
+            long deadline = System.currentTimeMillis() + timeoutMs;
+            byte[] buffer = new byte[16384];
+
+            try {
+                StructPollfd pollfd = new StructPollfd();
+                pollfd.fd = accessoryDescriptor.getFileDescriptor();
+                pollfd.events = (short) OsConstants.POLLIN;
+                StructPollfd[] pollfds = new StructPollfd[]{pollfd};
+
+                while (listening && System.currentTimeMillis() < deadline) {
+                    pollfd.revents = 0;
+                    int ready = Os.poll(pollfds, 120);
+
+                    if (!listening) break;
+
+                    if (ready > 0 && (pollfd.revents & OsConstants.POLLIN) != 0) {
+                        int count = accessoryInput.read(buffer);
+                        if (count < 0) break;
+
+                        if (count > 0) {
+                            // 8 MiB is enough to prove that the video port is alive
+                            // without allowing an unbounded diagnostic capture.
+                            int remaining = (8 * 1024 * 1024) - rx.size();
+                            if (remaining <= 0) break;
+
+                            int copy = Math.min(count, remaining);
+                            rx.write(buffer, 0, copy);
+
+                            // Once several hundred KB have arrived, that is already
+                            // enough to inspect the stream. Keep a small minimum time.
+                            if (rx.size() >= 6 * 1024 * 1024) break;
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                appendEventFromWorker("Erro lendo LogicLink: "
+                        + t.getClass().getSimpleName() + " - " + safe(t.getMessage()));
+            } finally {
+                listening = false;
+
+                final byte[] received = rx.toByteArray();
+                final String result = analyzeLogicLinkPorts(received);
+
+                runOnUiThread(() -> {
+                    appendEvent("=== LOGICLINK VIDEO TEST ===\\n" + result);
+                    if (result.contains("VÍDEO 0x574A DETECTADO")) {
+                        statusView.setText("✅ Canal de vídeo 0x574A encontrado!");
+                    } else {
+                        statusView.setText("🟡 0x574A não apareceu neste teste");
+                    }
+                });
+            }
+        }, "PocketLogicLinkVideoTest");
+
+        listenThread.start();
+    }
+
+    private String analyzeLogicLinkPorts(byte[] data) {
+        if (data == null || data.length < 8) {
+            return "Nenhum dado suficiente recebido.";
+        }
+
+        java.util.LinkedHashMap<Integer, Integer> packetCount =
+                new java.util.LinkedHashMap<>();
+        java.util.LinkedHashMap<Integer, Long> byteCount =
+                new java.util.LinkedHashMap<>();
+
+        ByteArrayOutputStream video = new ByteArrayOutputStream();
+
+        int validPackets = 0;
+        int malformedOrUnframed = 0;
+        int pos = 0;
+
+        while (pos < data.length) {
+            if (pos + 8 <= data.length
+                    && (data[pos] & 0xFF) == 0x55
+                    && (data[pos + 1] & 0xFF) == 0xCC) {
+
+                int port = (data[pos + 2] & 0xFF)
+                        | ((data[pos + 3] & 0xFF) << 8);
+
+                int len = (data[pos + 4] & 0xFF)
+                        | ((data[pos + 5] & 0xFF) << 8);
+
+                int unknown = (data[pos + 6] & 0xFF)
+                        | ((data[pos + 7] & 0xFF) << 8);
+
+                int payloadStart = pos + 8;
+                int payloadEnd = payloadStart + len;
+
+                if (unknown == 0 && len >= 0 && payloadEnd <= data.length) {
+                    validPackets++;
+
+                    Integer pc = packetCount.get(port);
+                    packetCount.put(port, pc == null ? 1 : pc + 1);
+
+                    Long bc = byteCount.get(port);
+                    byteCount.put(port, (bc == null ? 0L : bc) + len);
+
+                    if (port == 0x574A && len > 0) {
+                        int room = (2 * 1024 * 1024) - video.size();
+                        if (room > 0) {
+                            int copy = Math.min(len, room);
+                            video.write(data, payloadStart, copy);
+                        }
+                    }
+
+                    pos = payloadEnd;
+                    continue;
+                }
+            }
+
+            malformedOrUnframed++;
+            pos++;
+        }
+
+        byte[] videoBytes = video.toByteArray();
+        NalStats annexB = scanAnnexBNals(videoBytes);
+        NalStats avcc = scanAvccNals(videoBytes);
+
+        StringBuilder out = new StringBuilder();
+        out.append("Captura total: ").append(data.length).append(" bytes\\n");
+        out.append("Pacotes LogicLink válidos: ").append(validPackets).append("\\n");
+        out.append("Bytes não enquadrados durante a varredura: ")
+                .append(malformedOrUnframed).append("\\n\\n");
+
+        out.append("PORTAS ENCONTRADAS:\\n");
+        if (packetCount.isEmpty()) {
+            out.append("(nenhuma)\\n");
+        } else {
+            for (java.util.Map.Entry<Integer, Integer> e : packetCount.entrySet()) {
+                int port = e.getKey();
+                long bytes = byteCount.get(port);
+
+                out.append(String.format(Locale.US,
+                        "0x%04X : %d pacote(s), %d bytes",
+                        port, e.getValue(), bytes));
+
+                if (port == 0x5749) out.append("  ← CONTROLE DUML");
+                if (port == 0x574A) out.append("  ← VÍDEO");
+                out.append("\\n");
+            }
+        }
+
+        out.append("\\n");
+
+        if (packetCount.containsKey(0x574A)) {
+            out.append("*** VÍDEO 0x574A DETECTADO ***\\n");
+            out.append("Payload de vídeo coletado para análise: ")
+                    .append(videoBytes.length).append(" bytes\\n");
+            out.append("H.264 Annex-B: ").append(formatNalStats(annexB)).append("\\n");
+            out.append("H.264 AVCC: ").append(formatNalStats(avcc)).append("\\n");
+
+            if (videoBytes.length > 0) {
+                int preview = Math.min(videoBytes.length, 96);
+                byte[] p = new byte[preview];
+                System.arraycopy(videoBytes, 0, p, 0, preview);
+                out.append("Primeiros bytes do vídeo: ").append(toHex(p)).append("\\n");
+            }
+        } else {
+            out.append("PORT 0x574A não apareceu.\\n");
+            out.append("O canal 0x5749 continua sendo o controle. ")
+                    .append("A sequência pública de serviço não iniciou vídeo nesta tentativa.");
+        }
+
+        return out.toString();
     }
 
     private synchronized void sendReadOnlyCameraModeQuery() {
@@ -1954,7 +2209,7 @@ public class MainActivity extends Activity {
                     .append(entry.getKey()).append("\n");
         }
 
-        out.append("\n1.0 Alpha conecta automaticamente e executa um probe de Live View somente com consultas GET.");
+        out.append("\n1.3 testa de forma direcionada o serviço LogicLink e procura o port 0x574A de vídeo.");
 
         return out.toString();
     }
