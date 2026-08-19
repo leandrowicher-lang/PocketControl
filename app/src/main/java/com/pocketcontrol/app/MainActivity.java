@@ -167,7 +167,7 @@ public class MainActivity extends Activity {
         root.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("Pocket Control 1.0 Alpha");
+        title.setText("Pocket Control 1.1 Video Mapper");
         title.setTextSize(24f);
         title.setGravity(Gravity.CENTER_HORIZONTAL);
         root.addView(title, new LinearLayout.LayoutParams(
@@ -175,7 +175,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("Conexão automática + preparação do Live View");
+        subtitle.setText("Mapeando o canal real de vídeo da Osmo Pocket 1");
         subtitle.setTextSize(15f);
         subtitle.setGravity(Gravity.CENTER_HORIZONTAL);
         subtitle.setPadding(0, dp(6), 0, dp(14));
@@ -288,7 +288,7 @@ public class MainActivity extends Activity {
             }
 
             StringBuilder out = new StringBuilder();
-            out.append("Pocket Control 1.0 Alpha\n");
+            out.append("Pocket Control 1.1 Video Mapper\n");
             out.append("Android: ").append(Build.VERSION.RELEASE)
                     .append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
             out.append("Aparelho: ").append(Build.MANUFACTURER)
@@ -890,56 +890,169 @@ public class MainActivity extends Activity {
     }
 
     private String analyzeH264Markers(byte[] data) {
-        if (data == null || data.length < 5) {
+        if (data == null || data.length < 8) {
             return "Sem dados suficientes.";
         }
 
-        int startCodes = 0;
-        int sps = 0;
-        int pps = 0;
-        int idr = 0;
-        int nonIdr = 0;
-        int sei = 0;
+        int outerBlocks = 0;
+        long totalOuterPayload = 0;
+        long controlBytes = 0;
+        long unexplainedBytes = 0;
+        int maxOuterPayload = 0;
+
+        ByteArrayOutputStream unexplained = new ByteArrayOutputStream();
+
+        int pos = 0;
+        while (pos + 8 <= data.length) {
+            if (!looksLikePocketTransportHeader(data, pos)) {
+                pos++;
+                continue;
+            }
+
+            long lenLong = readLe32(data, pos + 4);
+            if (lenLong < 0 || lenLong > Integer.MAX_VALUE) {
+                pos++;
+                continue;
+            }
+
+            int len = (int) lenLong;
+            int payloadStart = pos + 8;
+            int payloadEnd = payloadStart + len;
+
+            if (payloadEnd > data.length) break;
+
+            outerBlocks++;
+            totalOuterPayload += len;
+            if (len > maxOuterPayload) maxOuterPayload = len;
+
+            int parsed = countContiguousDumlBytes(data, payloadStart, payloadEnd);
+
+            if (parsed > 0) {
+                controlBytes += parsed;
+            }
+
+            if (parsed < len) {
+                int rawStart = payloadStart + parsed;
+                int rawLen = payloadEnd - rawStart;
+                unexplainedBytes += rawLen;
+                unexplained.write(data, rawStart, rawLen);
+            }
+
+            pos = payloadEnd;
+        }
+
+        byte[] raw = unexplained.toByteArray();
+        NalStats stats = scanAnnexBNals(raw);
+
+        StringBuilder out = new StringBuilder();
+        out.append("Blocos 55 CC 49 57: ").append(outerBlocks).append("\\n");
+        out.append("Payload total: ").append(totalOuterPayload).append(" bytes\\n");
+        out.append("Bytes reconhecidos como DUML: ").append(controlBytes).append("\\n");
+        out.append("Bytes fora do DUML: ").append(unexplainedBytes).append("\\n");
+        out.append("Maior payload externo: ").append(maxOuterPayload).append(" bytes\\n\\n");
+
+        if (unexplainedBytes == 0) {
+            out.append("RESULTADO: todo o tráfego observado é controle DUML. ")
+                    .append("Nenhum fluxo de vídeo bruto apareceu neste canal.\\n");
+        } else {
+            out.append("NAL H.264 somente nos bytes FORA do DUML:\\n");
+            out.append("Start codes=").append(stats.startCodes)
+                    .append(" | SPS=").append(stats.sps)
+                    .append(" | PPS=").append(stats.pps)
+                    .append(" | IDR=").append(stats.idr)
+                    .append(" | non-IDR=").append(stats.nonIdr)
+                    .append(" | SEI=").append(stats.sei)
+                    .append(" | outros=").append(stats.other)
+                    .append("\\n");
+
+            if (stats.sps > 0 && stats.pps > 0 && stats.idr > 0) {
+                out.append("RESULTADO: há forte evidência de H.264 decodificável neste canal.\\n");
+            } else {
+                out.append("RESULTADO: ainda não há conjunto SPS+PPS+IDR suficiente ")
+                        .append("para considerar isto um Live View H.264 válido.\\n");
+            }
+
+            int preview = Math.min(raw.length, 96);
+            if (preview > 0) {
+                byte[] p = new byte[preview];
+                System.arraycopy(raw, 0, p, 0, preview);
+                out.append("Primeiros bytes não-DUML: ").append(toHex(p)).append("\\n");
+            }
+        }
+
+        out.append("\\nObservação: o scanner antigo procurava 00 00 01 no tráfego inteiro ")
+                .append("e podia contar falsos positivos dentro de mensagens de controle.");
+
+        return out.toString();
+    }
+
+    private int countContiguousDumlBytes(byte[] data, int start, int end) {
+        int p = start;
+        int parsed = 0;
+
+        while (p + 13 <= end && (data[p] & 0xFF) == 0x55) {
+            int frameLength =
+                    (data[p + 1] & 0xFF) | ((data[p + 2] & 0x03) << 8);
+
+            if (frameLength < 13 || p + frameLength > end) {
+                break;
+            }
+
+            parsed += frameLength;
+            p += frameLength;
+        }
+
+        return parsed;
+    }
+
+    private static class NalStats {
+        int startCodes;
+        int sps;
+        int pps;
+        int idr;
+        int nonIdr;
+        int sei;
+        int other;
+    }
+
+    private NalStats scanAnnexBNals(byte[] data) {
+        NalStats s = new NalStats();
+
+        if (data == null || data.length < 5) return s;
 
         for (int i = 0; i + 4 < data.length; i++) {
-            int nalIndex = -1;
+            int nal = -1;
 
             if (i + 4 < data.length
-                    && data[i] == 0x00
-                    && data[i + 1] == 0x00
-                    && data[i + 2] == 0x00
-                    && data[i + 3] == 0x01) {
-                nalIndex = i + 4;
-            } else if (data[i] == 0x00
-                    && data[i + 1] == 0x00
-                    && data[i + 2] == 0x01) {
-                nalIndex = i + 3;
+                    && data[i] == 0
+                    && data[i + 1] == 0
+                    && data[i + 2] == 0
+                    && data[i + 3] == 1) {
+                nal = i + 4;
+            } else if (data[i] == 0
+                    && data[i + 1] == 0
+                    && data[i + 2] == 1) {
+                nal = i + 3;
             }
 
-            if (nalIndex >= 0 && nalIndex < data.length) {
-                startCodes++;
-                int type = data[nalIndex] & 0x1F;
+            if (nal >= 0 && nal < data.length) {
+                s.startCodes++;
+                int type = data[nal] & 0x1F;
 
-                if (type == 7) sps++;
-                else if (type == 8) pps++;
-                else if (type == 5) idr++;
-                else if (type == 1) nonIdr++;
-                else if (type == 6) sei++;
+                switch (type) {
+                    case 1: s.nonIdr++; break;
+                    case 5: s.idr++; break;
+                    case 6: s.sei++; break;
+                    case 7: s.sps++; break;
+                    case 8: s.pps++; break;
+                    default: s.other++; break;
+                }
 
-                i = nalIndex;
+                i = nal;
             }
         }
 
-        if (startCodes == 0) {
-            return "Nenhum NAL H.264 Annex-B detectado no tráfego atual.";
-        }
-
-        return "Start codes=" + startCodes
-                + " | SPS=" + sps
-                + " | PPS=" + pps
-                + " | IDR=" + idr
-                + " | non-IDR=" + nonIdr
-                + " | SEI=" + sei;
+        return s;
     }
 
     private synchronized void sendReadOnlyCameraModeQuery() {
