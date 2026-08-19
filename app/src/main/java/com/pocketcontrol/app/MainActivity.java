@@ -18,14 +18,19 @@ import android.hardware.usb.UsbManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
+import android.system.Os;
+import android.system.OsConstants;
+import android.system.StructPollfd;
 import android.view.Gravity;
-import android.view.View;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.Locale;
 
@@ -39,7 +44,16 @@ public class MainActivity extends Activity {
     private TextView logView;
     private PendingIntent permissionIntent;
     private boolean receiverRegistered = false;
+
+    private final StringBuilder eventLog = new StringBuilder();
+    private String baseDiagnostic = "";
     private String lastDiagnostic = "";
+
+    private ParcelFileDescriptor accessoryDescriptor;
+    private FileInputStream accessoryInput;
+    private FileOutputStream accessoryOutput;
+    private volatile boolean listening = false;
+    private Thread listenThread;
 
     private final BroadcastReceiver usbPermissionReceiver = new BroadcastReceiver() {
         @Override
@@ -55,14 +69,14 @@ public class MainActivity extends Activity {
             UsbAccessory accessory = getUsbAccessoryExtra(intent);
 
             if (granted) {
-                appendRuntime("Permissão USB concedida pelo Android.");
-                if (device != null) {
+                appendEvent("Permissão USB concedida pelo Android.");
+                if (accessory != null) {
+                    openAccessoryChannel(accessory);
+                } else if (device != null) {
                     testOpenDevice(device);
-                } else if (accessory != null) {
-                    testOpenAccessory(accessory);
                 }
             } else {
-                appendRuntime("Permissão USB negada.");
+                appendEvent("Permissão USB negada.");
             }
 
             refreshUsb();
@@ -92,12 +106,15 @@ public class MainActivity extends Activity {
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-        appendRuntime("Novo evento USB recebido pelo aplicativo.");
+        appendEvent("Novo evento USB recebido: " + safe(intent.getAction()));
         refreshUsb();
     }
 
     @Override
     protected void onDestroy() {
+        stopListening();
+        closeAccessoryChannel();
+
         if (receiverRegistered) {
             try {
                 unregisterReceiver(usbPermissionReceiver);
@@ -113,8 +130,6 @@ public class MainActivity extends Activity {
 
         int flags = PendingIntent.FLAG_UPDATE_CURRENT;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            // O UsbManager adiciona o dispositivo/acessório e o resultado da
-            // permissão ao PendingIntent; por isso ele precisa ser mutável.
             flags |= PendingIntent.FLAG_MUTABLE;
         }
 
@@ -139,7 +154,7 @@ public class MainActivity extends Activity {
         root.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("Pocket Control 0.1");
+        title.setText("Pocket Control 0.2");
         title.setTextSize(24f);
         title.setGravity(Gravity.CENTER_HORIZONTAL);
         root.addView(title, new LinearLayout.LayoutParams(
@@ -147,7 +162,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("Diagnóstico USB para DJI Osmo Pocket 1");
+        subtitle.setText("Canal USB da DJI Osmo Pocket 1");
         subtitle.setTextSize(15f);
         subtitle.setGravity(Gravity.CENTER_HORIZONTAL);
         subtitle.setPadding(0, dp(6), 0, dp(14));
@@ -160,23 +175,44 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
-        LinearLayout buttons = new LinearLayout(this);
-        buttons.setOrientation(LinearLayout.HORIZONTAL);
-        buttons.setPadding(0, dp(8), 0, dp(8));
+        LinearLayout row1 = new LinearLayout(this);
+        row1.setOrientation(LinearLayout.HORIZONTAL);
+        row1.setPadding(0, dp(8), 0, dp(4));
 
         Button refreshButton = new Button(this);
         refreshButton.setText("Atualizar USB");
         refreshButton.setOnClickListener(v -> refreshUsb());
-        buttons.addView(refreshButton, new LinearLayout.LayoutParams(
+        row1.addView(refreshButton, new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
-        Button permissionButton = new Button(this);
-        permissionButton.setText("Pedir acesso");
-        permissionButton.setOnClickListener(v -> requestFirstUsbPermission());
-        buttons.addView(permissionButton, new LinearLayout.LayoutParams(
+        Button openButton = new Button(this);
+        openButton.setText("Abrir canal");
+        openButton.setOnClickListener(v -> openFirstAccessory());
+        row1.addView(openButton, new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
-        root.addView(buttons);
+        root.addView(row1);
+
+        LinearLayout row2 = new LinearLayout(this);
+        row2.setOrientation(LinearLayout.HORIZONTAL);
+        row2.setPadding(0, dp(4), 0, dp(8));
+
+        Button listenButton = new Button(this);
+        listenButton.setText("Escutar 10 s");
+        listenButton.setOnClickListener(v -> startPassiveListen());
+        row2.addView(listenButton, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        Button closeButton = new Button(this);
+        closeButton.setText("Fechar canal");
+        closeButton.setOnClickListener(v -> {
+            stopListening();
+            closeAccessoryChannel();
+        });
+        row2.addView(closeButton, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        root.addView(row2);
 
         Button copyButton = new Button(this);
         copyButton.setText("Copiar diagnóstico");
@@ -202,18 +238,27 @@ public class MainActivity extends Activity {
         try {
             if (usbManager == null) {
                 statusView.setText("❌ Serviço USB indisponível neste aparelho.");
-                logView.setText("O Android não forneceu UsbManager.");
+                baseDiagnostic = "O Android não forneceu UsbManager.";
+                renderLog();
                 return;
             }
 
             StringBuilder out = new StringBuilder();
-            out.append("Pocket Control 0.1\n");
+            out.append("Pocket Control 0.2\n");
             out.append("Android: ").append(Build.VERSION.RELEASE)
                     .append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
             out.append("Aparelho: ").append(Build.MANUFACTURER)
                     .append(" ").append(Build.MODEL).append("\n");
-            out.append("ABI principal: ").append(Build.SUPPORTED_ABIS.length > 0
-                    ? Build.SUPPORTED_ABIS[0] : "desconhecida").append("\n\n");
+            out.append("ABIs: ");
+            if (Build.SUPPORTED_ABIS != null && Build.SUPPORTED_ABIS.length > 0) {
+                for (int i = 0; i < Build.SUPPORTED_ABIS.length; i++) {
+                    if (i > 0) out.append(", ");
+                    out.append(Build.SUPPORTED_ABIS[i]);
+                }
+            } else {
+                out.append("desconhecidas");
+            }
+            out.append("\n\n");
 
             boolean found = false;
             boolean djiLikely = false;
@@ -242,6 +287,8 @@ public class MainActivity extends Activity {
                             .append("Descrição: ").append(safe(a.getDescription())).append("\n")
                             .append("Versão: ").append(safe(a.getVersion())).append("\n")
                             .append("Permissão: ").append(usbManager.hasPermission(a) ? "SIM" : "NÃO")
+                            .append("\n")
+                            .append("Canal aberto: ").append(accessoryDescriptor != null ? "SIM" : "NÃO")
                             .append("\n\n");
                 }
             }
@@ -258,6 +305,7 @@ public class MainActivity extends Activity {
                 found = true;
                 out.append("=== USB DEVICES ===\n");
                 int index = 0;
+
                 for (UsbDevice d : devices.values()) {
                     index++;
                     String manufacturer = safe(callManufacturer(d));
@@ -293,21 +341,197 @@ public class MainActivity extends Activity {
                 statusView.setText("⚪ Nenhum dispositivo USB detectado");
                 out.append("Nenhum USB Device/Accessory foi encontrado.\n")
                         .append("Conecte a Osmo Pocket 1, ligue-a e toque em Atualizar USB.\n");
+            } else if (djiLikely && accessoryDescriptor != null) {
+                statusView.setText("🟢 Osmo detectada — canal aberto");
             } else if (djiLikely) {
-                statusView.setText("✅ Possível DJI / Osmo detectada");
+                statusView.setText("✅ Osmo Pocket detectada");
             } else {
                 statusView.setText("🟡 USB detectado — precisamos identificar");
             }
 
-            lastDiagnostic = out.toString();
-            logView.setText(lastDiagnostic);
+            baseDiagnostic = out.toString();
+            renderLog();
         } catch (Throwable t) {
-            // Esta versão de diagnóstico não deve fechar mesmo se um fabricante
-            // retornar dados USB inesperados.
             statusView.setText("⚠️ Erro capturado — o app continuou aberto");
-            lastDiagnostic = "Erro em refreshUsb():\n"
+            baseDiagnostic = "Erro em refreshUsb():\n"
                     + t.getClass().getName() + ": " + safe(t.getMessage());
-            logView.setText(lastDiagnostic);
+            renderLog();
+        }
+    }
+
+    private void openFirstAccessory() {
+        try {
+            UsbAccessory[] accessories = usbManager.getAccessoryList();
+            if (accessories == null || accessories.length == 0) {
+                appendEvent("Nenhum USB Accessory conectado.");
+                Toast.makeText(this, "Nenhuma Osmo detectada.", Toast.LENGTH_SHORT).show();
+                return;
+            }
+
+            UsbAccessory accessory = accessories[0];
+            if (!usbManager.hasPermission(accessory)) {
+                appendEvent("Solicitando permissão para o acessório...");
+                usbManager.requestPermission(accessory, permissionIntent);
+                return;
+            }
+
+            openAccessoryChannel(accessory);
+        } catch (Throwable t) {
+            appendEvent("Falha ao abrir acessório: " + t.getClass().getSimpleName()
+                    + " - " + safe(t.getMessage()));
+        }
+    }
+
+    private synchronized void openAccessoryChannel(UsbAccessory accessory) {
+        if (accessoryDescriptor != null) {
+            appendEvent("O canal já está aberto.");
+            return;
+        }
+
+        try {
+            accessoryDescriptor = usbManager.openAccessory(accessory);
+            if (accessoryDescriptor == null) {
+                appendEvent("Android retornou null ao abrir USB Accessory.");
+                statusView.setText("❌ Não foi possível abrir o canal");
+                return;
+            }
+
+            accessoryInput = new FileInputStream(accessoryDescriptor.getFileDescriptor());
+            accessoryOutput = new FileOutputStream(accessoryDescriptor.getFileDescriptor());
+
+            appendEvent("Canal USB Accessory aberto. fd=" + accessoryDescriptor.getFd());
+            appendEvent("Nenhum comando foi enviado à câmera nesta versão.");
+            statusView.setText("🟢 Osmo detectada — canal aberto");
+            refreshUsb();
+        } catch (Throwable t) {
+            appendEvent("Erro ao abrir canal: " + t.getClass().getSimpleName()
+                    + " - " + safe(t.getMessage()));
+            closeAccessoryChannel();
+        }
+    }
+
+    private synchronized void closeAccessoryChannel() {
+        listening = false;
+
+        if (accessoryInput != null) {
+            try {
+                accessoryInput.close();
+            } catch (Exception ignored) {
+            }
+            accessoryInput = null;
+        }
+
+        if (accessoryOutput != null) {
+            try {
+                accessoryOutput.close();
+            } catch (Exception ignored) {
+            }
+            accessoryOutput = null;
+        }
+
+        if (accessoryDescriptor != null) {
+            try {
+                accessoryDescriptor.close();
+            } catch (Exception ignored) {
+            }
+            accessoryDescriptor = null;
+            appendEvent("Canal USB fechado.");
+        }
+
+        refreshUsb();
+    }
+
+    private void startPassiveListen() {
+        if (listening) {
+            Toast.makeText(this, "A escuta já está em andamento.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        if (accessoryDescriptor == null || accessoryInput == null) {
+            openFirstAccessory();
+            if (accessoryDescriptor == null || accessoryInput == null) {
+                appendEvent("Não foi possível iniciar a escuta: canal não abriu.");
+                return;
+            }
+        }
+
+        listening = true;
+        appendEvent("Escuta passiva iniciada por 10 segundos. Não enviaremos comandos.");
+        statusView.setText("👂 Escutando a Osmo por 10 s...");
+
+        listenThread = new Thread(() -> {
+            long deadline = System.currentTimeMillis() + 10_000L;
+            int total = 0;
+            int chunks = 0;
+            byte[] buffer = new byte[4096];
+
+            try {
+                StructPollfd pollfd = new StructPollfd();
+                pollfd.fd = accessoryDescriptor.getFileDescriptor();
+                pollfd.events = (short) OsConstants.POLLIN;
+                StructPollfd[] pollfds = new StructPollfd[]{pollfd};
+
+                while (listening && System.currentTimeMillis() < deadline) {
+                    pollfd.revents = 0;
+                    int ready = Os.poll(pollfds, 250);
+                    if (!listening) {
+                        break;
+                    }
+
+                    if (ready > 0 && (pollfd.revents & OsConstants.POLLIN) != 0) {
+                        int count = accessoryInput.read(buffer);
+                        if (count < 0) {
+                            appendEventFromWorker("A câmera encerrou o fluxo de leitura.");
+                            break;
+                        }
+                        if (count > 0) {
+                            total += count;
+                            chunks++;
+                            byte[] packet = new byte[count];
+                            System.arraycopy(buffer, 0, packet, 0, count);
+                            appendEventFromWorker("RX #" + chunks + " — " + count
+                                    + " bytes\nHEX: " + toHex(packet)
+                                    + "\nASCII: " + toAscii(packet));
+
+                            if (total >= 65536) {
+                                appendEventFromWorker("Limite de captura atingido (64 KiB).");
+                                break;
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                if (listening) {
+                    appendEventFromWorker("Erro durante leitura: "
+                            + t.getClass().getSimpleName() + " - " + safe(t.getMessage()));
+                }
+            } finally {
+                listening = false;
+                final int bytes = total;
+                final int packetCount = chunks;
+                runOnUiThread(() -> {
+                    appendEvent("Escuta finalizada: " + bytes + " bytes em "
+                            + packetCount + " bloco(s).");
+                    if (bytes == 0) {
+                        appendEvent("Zero bytes não significa falha: a Pocket pode esperar "
+                                + "um comando de protocolo antes de responder.");
+                    }
+                    statusView.setText(accessoryDescriptor != null
+                            ? "🟢 Canal aberto — escuta concluída"
+                            : "✅ Osmo Pocket detectada");
+                });
+            }
+        }, "PocketPassiveReader");
+
+        listenThread.start();
+    }
+
+    private void stopListening() {
+        listening = false;
+        Thread t = listenThread;
+        listenThread = null;
+        if (t != null) {
+            t.interrupt();
         }
     }
 
@@ -347,83 +571,23 @@ public class MainActivity extends Activity {
         return out.toString();
     }
 
-    private void requestFirstUsbPermission() {
-        try {
-            UsbAccessory[] accessories = usbManager.getAccessoryList();
-            if (accessories != null && accessories.length > 0) {
-                UsbAccessory a = accessories[0];
-                if (usbManager.hasPermission(a)) {
-                    Toast.makeText(this, "A permissão para o acessório já foi concedida.",
-                            Toast.LENGTH_SHORT).show();
-                    testOpenAccessory(a);
-                    refreshUsb();
-                } else {
-                    usbManager.requestPermission(a, permissionIntent);
-                }
-                return;
-            }
-
-            HashMap<String, UsbDevice> devices = usbManager.getDeviceList();
-            if (devices != null && !devices.isEmpty()) {
-                UsbDevice d = devices.values().iterator().next();
-                if (usbManager.hasPermission(d)) {
-                    Toast.makeText(this, "A permissão para o dispositivo já foi concedida.",
-                            Toast.LENGTH_SHORT).show();
-                    testOpenDevice(d);
-                    refreshUsb();
-                } else {
-                    usbManager.requestPermission(d, permissionIntent);
-                }
-                return;
-            }
-
-            Toast.makeText(this, "Nenhum USB conectado.", Toast.LENGTH_SHORT).show();
-        } catch (Throwable t) {
-            appendRuntime("Falha ao pedir acesso: " + t.getClass().getSimpleName()
-                    + " - " + safe(t.getMessage()));
-        }
-    }
-
     private void testOpenDevice(UsbDevice d) {
         UsbDeviceConnection connection = null;
         try {
             connection = usbManager.openDevice(d);
             if (connection != null) {
-                appendRuntime("Canal USB Device abriu com sucesso. fd="
+                appendEvent("Canal USB Device abriu com sucesso. fd="
                         + connection.getFileDescriptor());
             } else {
-                appendRuntime("Android retornou null ao abrir USB Device.");
+                appendEvent("Android retornou null ao abrir USB Device.");
             }
         } catch (Throwable t) {
-            appendRuntime("Falha ao abrir USB Device: " + t.getClass().getSimpleName()
+            appendEvent("Falha ao abrir USB Device: " + t.getClass().getSimpleName()
                     + " - " + safe(t.getMessage()));
         } finally {
             if (connection != null) {
                 try {
                     connection.close();
-                } catch (Exception ignored) {
-                }
-            }
-        }
-    }
-
-    private void testOpenAccessory(UsbAccessory a) {
-        ParcelFileDescriptor descriptor = null;
-        try {
-            descriptor = usbManager.openAccessory(a);
-            if (descriptor != null) {
-                appendRuntime("Canal USB Accessory abriu com sucesso. fd="
-                        + descriptor.getFd());
-            } else {
-                appendRuntime("Android retornou null ao abrir USB Accessory.");
-            }
-        } catch (Throwable t) {
-            appendRuntime("Falha ao abrir USB Accessory: " + t.getClass().getSimpleName()
-                    + " - " + safe(t.getMessage()));
-        } finally {
-            if (descriptor != null) {
-                try {
-                    descriptor.close();
                 } catch (Exception ignored) {
                 }
             }
@@ -440,14 +604,21 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void appendRuntime(String message) {
-        if (logView == null) {
-            return;
+    private void appendEvent(String message) {
+        if (message == null) return;
+        eventLog.append("\n[EVENTO] ").append(message).append("\n");
+        renderLog();
+    }
+
+    private void appendEventFromWorker(String message) {
+        runOnUiThread(() -> appendEvent(message));
+    }
+
+    private void renderLog() {
+        lastDiagnostic = baseDiagnostic + eventLog.toString();
+        if (logView != null) {
+            logView.setText(lastDiagnostic);
         }
-        String existing = logView.getText() == null ? "" : logView.getText().toString();
-        String updated = existing + "\n[EVENTO] " + message + "\n";
-        logView.setText(updated);
-        lastDiagnostic = updated;
     }
 
     private boolean containsDji(String value) {
@@ -484,6 +655,36 @@ public class MainActivity extends Activity {
             return intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY, UsbAccessory.class);
         }
         return (UsbAccessory) intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY);
+    }
+
+    private String toHex(byte[] data) {
+        StringBuilder sb = new StringBuilder();
+        int limit = Math.min(data.length, 1024);
+        for (int i = 0; i < limit; i++) {
+            if (i > 0) sb.append(' ');
+            sb.append(String.format(Locale.US, "%02X", data[i] & 0xFF));
+        }
+        if (data.length > limit) {
+            sb.append(" ... (+").append(data.length - limit).append(" bytes)");
+        }
+        return sb.toString();
+    }
+
+    private String toAscii(byte[] data) {
+        StringBuilder sb = new StringBuilder();
+        int limit = Math.min(data.length, 512);
+        for (int i = 0; i < limit; i++) {
+            int b = data[i] & 0xFF;
+            if (b >= 32 && b <= 126) {
+                sb.append((char) b);
+            } else {
+                sb.append('.');
+            }
+        }
+        if (data.length > limit) {
+            sb.append("...");
+        }
+        return sb.toString();
     }
 
     private String safe(String s) {
