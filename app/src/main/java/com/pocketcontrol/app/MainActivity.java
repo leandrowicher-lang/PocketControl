@@ -18,6 +18,8 @@ import android.hardware.usb.UsbManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
+import android.os.Handler;
+import android.os.Looper;
 import android.system.Os;
 import android.system.OsConstants;
 import android.system.StructPollfd;
@@ -57,6 +59,9 @@ public class MainActivity extends Activity {
     private Thread listenThread;
     private final ByteArrayOutputStream captureBuffer = new ByteArrayOutputStream();
     private int nextTxSequence = 1;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private boolean autoConnectAttempted = false;
+    private boolean liveViewProbeDone = false;
 
     private final BroadcastReceiver usbPermissionReceiver = new BroadcastReceiver() {
         @Override
@@ -95,6 +100,7 @@ public class MainActivity extends Activity {
         registerPermissionReceiver();
         buildUi();
         refreshUsb();
+        mainHandler.postDelayed(this::autoConnectPocket, 350);
     }
 
     @Override
@@ -102,6 +108,7 @@ public class MainActivity extends Activity {
         super.onResume();
         if (statusView != null) {
             refreshUsb();
+            mainHandler.postDelayed(this::autoConnectPocket, 250);
         }
     }
 
@@ -111,6 +118,9 @@ public class MainActivity extends Activity {
         setIntent(intent);
         appendEvent("Novo evento USB recebido: " + safe(intent.getAction()));
         refreshUsb();
+        autoConnectAttempted = false;
+        liveViewProbeDone = false;
+        mainHandler.postDelayed(this::autoConnectPocket, 180);
     }
 
     @Override
@@ -157,7 +167,7 @@ public class MainActivity extends Activity {
         root.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("Pocket Control 0.7");
+        title.setText("Pocket Control 1.0 Alpha");
         title.setTextSize(24f);
         title.setGravity(Gravity.CENTER_HORIZONTAL);
         root.addView(title, new LinearLayout.LayoutParams(
@@ -165,7 +175,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("Controle básico bidirecional da Osmo Pocket 1");
+        subtitle.setText("Conexão automática + preparação do Live View");
         subtitle.setTextSize(15f);
         subtitle.setGravity(Gravity.CENTER_HORIZONTAL);
         subtitle.setPadding(0, dp(6), 0, dp(14));
@@ -224,6 +234,13 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
+        Button liveViewProbeButton = new Button(this);
+        liveViewProbeButton.setText("TESTAR LIVE VIEW");
+        liveViewProbeButton.setOnClickListener(v -> runLiveViewProbe());
+        root.addView(liveViewProbeButton, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
         LinearLayout modeRow = new LinearLayout(this);
         modeRow.setOrientation(LinearLayout.HORIZONTAL);
 
@@ -271,7 +288,7 @@ public class MainActivity extends Activity {
             }
 
             StringBuilder out = new StringBuilder();
-            out.append("Pocket Control 0.7\n");
+            out.append("Pocket Control 1.0 Alpha\n");
             out.append("Android: ").append(Build.VERSION.RELEASE)
                     .append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
             out.append("Aparelho: ").append(Build.MANUFACTURER)
@@ -383,6 +400,38 @@ public class MainActivity extends Activity {
             baseDiagnostic = "Erro em refreshUsb():\n"
                     + t.getClass().getName() + ": " + safe(t.getMessage());
             renderLog();
+        }
+    }
+
+    private void autoConnectPocket() {
+        if (accessoryDescriptor != null) {
+            if (!liveViewProbeDone && !listening) {
+                mainHandler.postDelayed(this::runLiveViewProbe, 450);
+            }
+            return;
+        }
+
+        UsbAccessory[] accessories = usbManager.getAccessoryList();
+        if (accessories == null || accessories.length == 0) {
+            statusView.setText("⚪ Conecte a Osmo Pocket");
+            return;
+        }
+
+        UsbAccessory target = accessories[0];
+
+        if (!"DJI".equalsIgnoreCase(safe(target.getManufacturer()))
+                || !"HG210".equalsIgnoreCase(safe(target.getModel()))) {
+            statusView.setText("🟡 Acessório USB encontrado, aguardando Osmo Pocket");
+            return;
+        }
+
+        if (usbManager.hasPermission(target)) {
+            appendEvent("Conexão automática: DJI HG210 encontrada.");
+            openAccessoryChannel(target);
+        } else if (!autoConnectAttempted) {
+            autoConnectAttempted = true;
+            appendEvent("Conexão automática: solicitando permissão USB.");
+            usbManager.requestPermission(target, permissionIntent);
         }
     }
 
@@ -719,6 +768,178 @@ public class MainActivity extends Activity {
         }
 
         return lastMode;
+    }
+
+    /**
+     * Probe de Live View somente com comandos GET:
+     * 0x02/0x06 = Get USB Switch
+     * 0x02/0x8C = Racing Liveview Format Get
+     *
+     * Nenhum dos dois altera configuração da câmera.
+     */
+    private synchronized void runLiveViewProbe() {
+        if (liveViewProbeDone || listening) {
+            return;
+        }
+
+        if (accessoryDescriptor == null || accessoryOutput == null || accessoryInput == null) {
+            autoConnectPocket();
+            return;
+        }
+
+        final int seqUsb = nextTxSequence & 0xFFFF;
+        nextTxSequence = (nextTxSequence + 1) & 0xFFFF;
+        if (nextTxSequence == 0) nextTxSequence = 1;
+
+        final int seqFormat = nextTxSequence & 0xFFFF;
+        nextTxSequence = (nextTxSequence + 1) & 0xFFFF;
+        if (nextTxSequence == 0) nextTxSequence = 1;
+
+        try {
+            byte[] getUsb = buildDumlPacket(
+                    0x02, 0x01, seqUsb,
+                    0, 2, 0,
+                    0x02, 0x06,
+                    new byte[0]);
+
+            byte[] getLiveFormat = buildDumlPacket(
+                    0x02, 0x01, seqFormat,
+                    0, 2, 0,
+                    0x02, 0x8C,
+                    new byte[0]);
+
+            accessoryOutput.write(wrapPocketTransport(getUsb));
+            accessoryOutput.flush();
+
+            try { Thread.sleep(60); } catch (InterruptedException ignored) {}
+
+            accessoryOutput.write(wrapPocketTransport(getLiveFormat));
+            accessoryOutput.flush();
+
+            appendEvent("LIVE VIEW PROBE: consultas 0x02/0x06 e 0x02/0x8C enviadas.");
+            statusView.setText("🔎 Detectando canal de Live View...");
+
+            listenForLiveViewProbe(seqUsb, seqFormat, 3200L);
+
+        } catch (Throwable t) {
+            appendEvent("Falha no Live View Probe: "
+                    + t.getClass().getSimpleName() + " - " + safe(t.getMessage()));
+            statusView.setText("❌ Falha no teste de Live View");
+        }
+    }
+
+    private void listenForLiveViewProbe(
+            final int seqUsb,
+            final int seqFormat,
+            final long timeoutMs) {
+
+        if (listening) return;
+        listening = true;
+
+        listenThread = new Thread(() -> {
+            ByteArrayOutputStream rx = new ByteArrayOutputStream();
+            long deadline = System.currentTimeMillis() + timeoutMs;
+            byte[] buffer = new byte[8192];
+
+            try {
+                StructPollfd pollfd = new StructPollfd();
+                pollfd.fd = accessoryDescriptor.getFileDescriptor();
+                pollfd.events = (short) OsConstants.POLLIN;
+                StructPollfd[] pollfds = new StructPollfd[]{pollfd};
+
+                while (listening && System.currentTimeMillis() < deadline) {
+                    pollfd.revents = 0;
+                    int ready = Os.poll(pollfds, 120);
+
+                    if (!listening) break;
+
+                    if (ready > 0 && (pollfd.revents & OsConstants.POLLIN) != 0) {
+                        int count = accessoryInput.read(buffer);
+                        if (count < 0) break;
+
+                        if (count > 0) {
+                            rx.write(buffer, 0, count);
+                            if (rx.size() >= 131072) break;
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                appendEventFromWorker("Erro no Live View Probe: "
+                        + t.getClass().getSimpleName() + " - " + safe(t.getMessage()));
+            } finally {
+                listening = false;
+                liveViewProbeDone = true;
+
+                final byte[] received = rx.toByteArray();
+                final String usbRsp = findGenericResponse(received, seqUsb, 0x02, 0x06);
+                final String formatRsp = findGenericResponse(received, seqFormat, 0x02, 0x8C);
+                final String h264 = analyzeH264Markers(received);
+
+                runOnUiThread(() -> {
+                    appendEvent("=== LIVE VIEW PROBE ===\\n"
+                            + "GET USB SWITCH:\\n" + usbRsp + "\\n\\n"
+                            + "GET LIVEVIEW FORMAT:\\n" + formatRsp + "\\n\\n"
+                            + "BUSCA H.264:\\n" + h264);
+
+                    statusView.setText("🟢 Osmo conectada — Live View em preparação");
+                });
+            }
+        }, "PocketLiveViewProbe");
+
+        listenThread.start();
+    }
+
+    private String analyzeH264Markers(byte[] data) {
+        if (data == null || data.length < 5) {
+            return "Sem dados suficientes.";
+        }
+
+        int startCodes = 0;
+        int sps = 0;
+        int pps = 0;
+        int idr = 0;
+        int nonIdr = 0;
+        int sei = 0;
+
+        for (int i = 0; i + 4 < data.length; i++) {
+            int nalIndex = -1;
+
+            if (i + 4 < data.length
+                    && data[i] == 0x00
+                    && data[i + 1] == 0x00
+                    && data[i + 2] == 0x00
+                    && data[i + 3] == 0x01) {
+                nalIndex = i + 4;
+            } else if (data[i] == 0x00
+                    && data[i + 1] == 0x00
+                    && data[i + 2] == 0x01) {
+                nalIndex = i + 3;
+            }
+
+            if (nalIndex >= 0 && nalIndex < data.length) {
+                startCodes++;
+                int type = data[nalIndex] & 0x1F;
+
+                if (type == 7) sps++;
+                else if (type == 8) pps++;
+                else if (type == 5) idr++;
+                else if (type == 1) nonIdr++;
+                else if (type == 6) sei++;
+
+                i = nalIndex;
+            }
+        }
+
+        if (startCodes == 0) {
+            return "Nenhum NAL H.264 Annex-B detectado no tráfego atual.";
+        }
+
+        return "Start codes=" + startCodes
+                + " | SPS=" + sps
+                + " | PPS=" + pps
+                + " | IDR=" + idr
+                + " | non-IDR=" + nonIdr
+                + " | SEI=" + sei;
     }
 
     private synchronized void sendReadOnlyCameraModeQuery() {
@@ -1503,7 +1724,7 @@ public class MainActivity extends Activity {
                     .append(entry.getKey()).append("\n");
         }
 
-        out.append("\n0.7 adiciona troca controlada FOTO/VÍDEO (Camera Work Mode Set). Não inicia foto nem gravação.");
+        out.append("\n1.0 Alpha conecta automaticamente e executa um probe de Live View somente com consultas GET.");
 
         return out.toString();
     }
