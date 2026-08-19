@@ -56,6 +56,7 @@ public class MainActivity extends Activity {
     private volatile boolean listening = false;
     private Thread listenThread;
     private final ByteArrayOutputStream captureBuffer = new ByteArrayOutputStream();
+    private int nextTxSequence = 1;
 
     private final BroadcastReceiver usbPermissionReceiver = new BroadcastReceiver() {
         @Override
@@ -156,7 +157,7 @@ public class MainActivity extends Activity {
         root.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("Pocket Control 0.5");
+        title.setText("Pocket Control 0.6");
         title.setTextSize(24f);
         title.setGravity(Gravity.CENTER_HORIZONTAL);
         root.addView(title, new LinearLayout.LayoutParams(
@@ -164,7 +165,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("Canal USB da DJI Osmo Pocket 1");
+        subtitle.setText("Leitura + primeiro teste TX seguro da Osmo Pocket 1");
         subtitle.setTextSize(15f);
         subtitle.setGravity(Gravity.CENTER_HORIZONTAL);
         subtitle.setPadding(0, dp(6), 0, dp(14));
@@ -216,6 +217,13 @@ public class MainActivity extends Activity {
 
         root.addView(row2);
 
+        Button txTestButton = new Button(this);
+        txTestButton.setText("TESTAR TX — LER MODO DA CÂMERA");
+        txTestButton.setOnClickListener(v -> sendReadOnlyCameraModeQuery());
+        root.addView(txTestButton, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
         Button copyButton = new Button(this);
         copyButton.setText("Copiar diagnóstico");
         copyButton.setOnClickListener(v -> copyDiagnostic());
@@ -246,7 +254,7 @@ public class MainActivity extends Activity {
             }
 
             StringBuilder out = new StringBuilder();
-            out.append("Pocket Control 0.5\n");
+            out.append("Pocket Control 0.6\n");
             out.append("Android: ").append(Build.VERSION.RELEASE)
                     .append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
             out.append("Aparelho: ").append(Build.MANUFACTURER)
@@ -402,7 +410,7 @@ public class MainActivity extends Activity {
             accessoryOutput = new FileOutputStream(accessoryDescriptor.getFileDescriptor());
 
             appendEvent("Canal USB Accessory aberto. fd=" + accessoryDescriptor.getFd());
-            appendEvent("Nenhum comando foi enviado à câmera nesta versão.");
+            appendEvent("0.6: nenhum comando é enviado automaticamente. O botão TX envia apenas uma consulta de leitura.");
             statusView.setText("🟢 Osmo detectada — canal aberto");
             refreshUsb();
         } catch (Throwable t) {
@@ -410,6 +418,377 @@ public class MainActivity extends Activity {
                     + " - " + safe(t.getMessage()));
             closeAccessoryChannel();
         }
+    }
+
+
+    /**
+     * Primeiro teste de transmissão do projeto.
+     *
+     * Envia somente CAMERA / Camera Work Mode Get (cmd set 0x02, cmd 0x11).
+     * Este comando é de consulta e não altera configuração, gravação ou gimbal.
+     */
+    private synchronized void sendReadOnlyCameraModeQuery() {
+        if (listening) {
+            Toast.makeText(this,
+                    "Espere a escuta de 10 s terminar antes do teste TX.",
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        if (accessoryDescriptor == null || accessoryOutput == null || accessoryInput == null) {
+            openFirstAccessory();
+            if (accessoryDescriptor == null || accessoryOutput == null || accessoryInput == null) {
+                appendEvent("TX cancelado: não foi possível abrir o canal USB Accessory.");
+                return;
+            }
+        }
+
+        final int seq = nextTxSequence & 0xFFFF;
+        nextTxSequence = (nextTxSequence + 1) & 0xFFFF;
+        if (nextTxSequence == 0) nextTxSequence = 1;
+
+        try {
+            // Sender: App (2), Receiver: Camera (1)
+            // Request, ACK after execution, no encryption.
+            byte[] duml = buildDumlPacket(
+                    0x02, 0x01, seq,
+                    0, 2, 0,
+                    0x02, 0x11,
+                    new byte[0]);
+
+            byte[] transport = wrapPocketTransport(duml);
+
+            accessoryOutput.write(transport);
+            accessoryOutput.flush();
+
+            appendEvent("TX seguro enviado: Camera Work Mode Get (0x02/0x11), seq="
+                    + seq + ", " + transport.length + " bytes no transporte.");
+            appendEvent("DUML TX: " + toHex(duml));
+            statusView.setText("📤 Consulta enviada — aguardando resposta...");
+
+            listenForReadOnlyResponse(seq, 0x02, 0x11, 2200L);
+        } catch (Throwable t) {
+            appendEvent("Falha no TX seguro: " + t.getClass().getSimpleName()
+                    + " - " + safe(t.getMessage()));
+            statusView.setText("❌ Falha ao transmitir consulta");
+        }
+    }
+
+    private void listenForReadOnlyResponse(
+            final int expectedSeq,
+            final int expectedCmdSet,
+            final int expectedCmdId,
+            final long timeoutMs) {
+
+        if (listening) {
+            appendEvent("Leitor ocupado; resposta TX não será monitorada agora.");
+            return;
+        }
+
+        listening = true;
+
+        listenThread = new Thread(() -> {
+            ByteArrayOutputStream rx = new ByteArrayOutputStream();
+            long deadline = System.currentTimeMillis() + timeoutMs;
+            byte[] buffer = new byte[4096];
+
+            try {
+                StructPollfd pollfd = new StructPollfd();
+                pollfd.fd = accessoryDescriptor.getFileDescriptor();
+                pollfd.events = (short) OsConstants.POLLIN;
+                StructPollfd[] pollfds = new StructPollfd[]{pollfd};
+
+                while (listening && System.currentTimeMillis() < deadline) {
+                    pollfd.revents = 0;
+                    int ready = Os.poll(pollfds, 120);
+
+                    if (!listening) break;
+
+                    if (ready > 0 && (pollfd.revents & OsConstants.POLLIN) != 0) {
+                        int count = accessoryInput.read(buffer);
+                        if (count < 0) break;
+                        if (count > 0) {
+                            rx.write(buffer, 0, count);
+                            if (rx.size() >= 32768) break;
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                appendEventFromWorker("Erro ao aguardar resposta TX: "
+                        + t.getClass().getSimpleName() + " - " + safe(t.getMessage()));
+            } finally {
+                listening = false;
+
+                final byte[] received = rx.toByteArray();
+                final String result = findCommandResponse(
+                        received, expectedSeq, expectedCmdSet, expectedCmdId);
+
+                runOnUiThread(() -> {
+                    appendEvent("RESULTADO DO TESTE TX\n" + result);
+                    statusView.setText(accessoryDescriptor != null
+                            ? "🟢 Canal aberto — teste TX concluído"
+                            : "✅ Teste TX concluído");
+                });
+            }
+        }, "PocketReadOnlyTxResponse");
+
+        listenThread.start();
+    }
+
+    private String findCommandResponse(
+            byte[] data, int expectedSeq, int expectedCmdSet, int expectedCmdId) {
+
+        if (data == null || data.length == 0) {
+            return "Nenhum byte recebido após a consulta.";
+        }
+
+        int outerCount = 0;
+        int frameCount = 0;
+        int responseCount = 0;
+        StringBuilder matches = new StringBuilder();
+
+        int pos = 0;
+        while (pos + 8 <= data.length) {
+            if (!looksLikePocketTransportHeader(data, pos)) {
+                pos++;
+                continue;
+            }
+
+            long payloadLengthLong = readLe32(data, pos + 4);
+            if (payloadLengthLong < 0 || payloadLengthLong > Integer.MAX_VALUE) {
+                pos++;
+                continue;
+            }
+
+            int transportPayloadLength = (int) payloadLengthLong;
+            int payloadStart = pos + 8;
+            int payloadEnd = Math.min(data.length, payloadStart + transportPayloadLength);
+            outerCount++;
+
+            int p = payloadStart;
+            while (p + 13 <= payloadEnd) {
+                if ((data[p] & 0xFF) != 0x55) {
+                    p++;
+                    continue;
+                }
+
+                int frameLength =
+                        (data[p + 1] & 0xFF) | ((data[p + 2] & 0x03) << 8);
+
+                if (frameLength < 13 || p + frameLength > payloadEnd) {
+                    p++;
+                    continue;
+                }
+
+                frameCount++;
+
+                int sender = data[p + 4] & 0x1F;
+                int receiver = data[p + 5] & 0x1F;
+                int seq = (data[p + 6] & 0xFF) | ((data[p + 7] & 0xFF) << 8);
+                int cmdType = data[p + 8] & 0xFF;
+                int packetType = (cmdType >> 7) & 0x01;
+                int ackType = (cmdType >> 5) & 0x03;
+                int encryptType = cmdType & 0x07;
+                int cmdSet = data[p + 9] & 0xFF;
+                int cmdId = data[p + 10] & 0xFF;
+                int innerPayloadLength = frameLength - 13;
+                int innerPayloadStart = p + 11;
+
+                if (packetType == 1
+                        && cmdSet == expectedCmdSet
+                        && cmdId == expectedCmdId
+                        && seq == expectedSeq) {
+
+                    responseCount++;
+
+                    byte[] payload = new byte[Math.max(0, innerPayloadLength)];
+                    if (innerPayloadLength > 0) {
+                        System.arraycopy(
+                                data, innerPayloadStart,
+                                payload, 0, innerPayloadLength);
+                    }
+
+                    matches.append("Resposta #").append(responseCount)
+                            .append(": ")
+                            .append(sourceName(sender)).append(" → ")
+                            .append(sourceName(receiver))
+                            .append(", seq=").append(seq)
+                            .append(", ACK=").append(ackType)
+                            .append(", ENC=").append(encryptType)
+                            .append(", payload=").append(innerPayloadLength)
+                            .append(" byte(s)\n");
+
+                    matches.append("Payload HEX: ")
+                            .append(payload.length == 0 ? "(vazio)" : toHex(payload))
+                            .append("\n");
+
+                    if (payload.length == 1) {
+                        int value = payload[0] & 0xFF;
+                        matches.append("Possível modo retornado: ")
+                                .append(cameraModeName(value))
+                                .append(" (").append(value).append(")\n");
+                    } else if (payload.length >= 2) {
+                        int first = payload[0] & 0xFF;
+                        int second = payload[1] & 0xFF;
+                        matches.append("Primeiros valores: ")
+                                .append(first).append(", ").append(second)
+                                .append(". Se o primeiro for status=0, o segundo pode ser o modo: ")
+                                .append(cameraModeName(second))
+                                .append(" (").append(second).append(")\n");
+                    }
+
+                    matches.append("\n");
+                }
+
+                p += frameLength;
+            }
+
+            if (payloadStart + transportPayloadLength <= data.length) {
+                pos = payloadStart + transportPayloadLength;
+            } else {
+                break;
+            }
+        }
+
+        StringBuilder out = new StringBuilder();
+        out.append("Recebidos ").append(data.length).append(" bytes em ~2,2 s.\n");
+        out.append("Blocos DJI: ").append(outerCount)
+                .append(" | Quadros DUML: ").append(frameCount).append("\n");
+
+        if (responseCount == 0) {
+            out.append("Nenhuma resposta 0x")
+                    .append(hex2(expectedCmdSet)).append("/0x")
+                    .append(hex2(expectedCmdId))
+                    .append(" com seq=").append(expectedSeq)
+                    .append(" foi encontrada.\n")
+                    .append("Isso NÃO significa que o canal de saída está quebrado; ")
+                    .append("pode indicar que a Pocket usa outro envelope/ACK para comandos do app.");
+        } else {
+            out.append("Resposta correspondente encontrada: ")
+                    .append(responseCount).append("\n\n")
+                    .append(matches);
+        }
+
+        return out.toString();
+    }
+
+    private byte[] buildDumlPacket(
+            int senderInfo,
+            int receiverInfo,
+            int seq,
+            int packetType,
+            int ackType,
+            int encryptType,
+            int cmdSet,
+            int cmdId,
+            byte[] payload) {
+
+        if (payload == null) payload = new byte[0];
+
+        int wholeLength = 11 + payload.length + 2;
+        if (wholeLength > 1023) {
+            throw new IllegalArgumentException("Pacote DUML grande demais");
+        }
+
+        byte[] out = new byte[wholeLength];
+
+        out[0] = 0x55;
+
+        int verLengthTag = ((1 & 0x3F) << 10) | (wholeLength & 0x03FF);
+        out[1] = (byte) (verLengthTag & 0xFF);
+        out[2] = (byte) ((verLengthTag >> 8) & 0xFF);
+
+        out[3] = (byte) crc8Dji(0x77, out, 0, 3);
+
+        out[4] = (byte) (senderInfo & 0xFF);
+        out[5] = (byte) (receiverInfo & 0xFF);
+        out[6] = (byte) (seq & 0xFF);
+        out[7] = (byte) ((seq >> 8) & 0xFF);
+
+        int cmdTypeData =
+                ((packetType & 0x01) << 7)
+                | ((ackType & 0x03) << 5)
+                | (encryptType & 0x07);
+
+        out[8] = (byte) cmdTypeData;
+        out[9] = (byte) (cmdSet & 0xFF);
+        out[10] = (byte) (cmdId & 0xFF);
+
+        if (payload.length > 0) {
+            System.arraycopy(payload, 0, out, 11, payload.length);
+        }
+
+        int crc16 = crc16Dji(out, 0, wholeLength - 2);
+        out[wholeLength - 2] = (byte) (crc16 & 0xFF);
+        out[wholeLength - 1] = (byte) ((crc16 >> 8) & 0xFF);
+
+        return out;
+    }
+
+    private byte[] wrapPocketTransport(byte[] duml) {
+        byte[] out = new byte[8 + duml.length];
+
+        out[0] = 0x55;
+        out[1] = (byte) 0xCC;
+        out[2] = 0x49;
+        out[3] = 0x57;
+
+        int length = duml.length;
+        out[4] = (byte) (length & 0xFF);
+        out[5] = (byte) ((length >> 8) & 0xFF);
+        out[6] = (byte) ((length >> 16) & 0xFF);
+        out[7] = (byte) ((length >> 24) & 0xFF);
+
+        System.arraycopy(duml, 0, out, 8, duml.length);
+        return out;
+    }
+
+    /**
+     * DJI DUML header CRC-8.
+     * Equivalente à tabela usada pelo dji-firmware-tools:
+     * seed 0x77, polinômio refletido 0x8C.
+     */
+    private int crc8Dji(int seed, byte[] data, int offset, int length) {
+        int crc = seed & 0xFF;
+
+        for (int i = 0; i < length; i++) {
+            crc ^= data[offset + i] & 0xFF;
+
+            for (int bit = 0; bit < 8; bit++) {
+                if ((crc & 0x01) != 0) {
+                    crc = (crc >> 1) ^ 0x8C;
+                } else {
+                    crc >>= 1;
+                }
+                crc &= 0xFF;
+            }
+        }
+
+        return crc & 0xFF;
+    }
+
+    /**
+     * DJI DUML packet CRC-16.
+     * Seed 0x3692; implementação bit a bit equivalente à tabela
+     * usada pelo dji-firmware-tools.
+     */
+    private int crc16Dji(byte[] data, int offset, int length) {
+        int crc = 0x3692;
+
+        for (int i = 0; i < length; i++) {
+            crc ^= data[offset + i] & 0xFF;
+
+            for (int bit = 0; bit < 8; bit++) {
+                if ((crc & 0x0001) != 0) {
+                    crc = (crc >> 1) ^ 0x8408;
+                } else {
+                    crc >>= 1;
+                }
+                crc &= 0xFFFF;
+            }
+        }
+
+        return crc & 0xFFFF;
     }
 
     private synchronized void closeAccessoryChannel() {
@@ -830,7 +1209,7 @@ public class MainActivity extends Activity {
                     .append(entry.getKey()).append("\n");
         }
 
-        out.append("\n0.5 ainda é somente leitura. Nenhum comando é enviado à Osmo.");
+        out.append("\n0.6 mantém a escuta passiva e adiciona apenas um botão TX de CONSULTA (Camera Work Mode Get).");
 
         return out.toString();
     }
