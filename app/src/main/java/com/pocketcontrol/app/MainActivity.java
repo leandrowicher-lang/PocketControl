@@ -157,7 +157,7 @@ public class MainActivity extends Activity {
         root.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("Pocket Control 0.6");
+        title.setText("Pocket Control 0.7");
         title.setTextSize(24f);
         title.setGravity(Gravity.CENTER_HORIZONTAL);
         root.addView(title, new LinearLayout.LayoutParams(
@@ -165,7 +165,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("Leitura + primeiro teste TX seguro da Osmo Pocket 1");
+        subtitle.setText("Controle básico bidirecional da Osmo Pocket 1");
         subtitle.setTextSize(15f);
         subtitle.setGravity(Gravity.CENTER_HORIZONTAL);
         subtitle.setPadding(0, dp(6), 0, dp(14));
@@ -224,6 +224,23 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
+        LinearLayout modeRow = new LinearLayout(this);
+        modeRow.setOrientation(LinearLayout.HORIZONTAL);
+
+        Button photoModeButton = new Button(this);
+        photoModeButton.setText("MODO FOTO");
+        photoModeButton.setOnClickListener(v -> sendSetCameraMode(0));
+        modeRow.addView(photoModeButton, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        Button videoModeButton = new Button(this);
+        videoModeButton.setText("MODO VÍDEO");
+        videoModeButton.setOnClickListener(v -> sendSetCameraMode(1));
+        modeRow.addView(videoModeButton, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        root.addView(modeRow);
+
         Button copyButton = new Button(this);
         copyButton.setText("Copiar diagnóstico");
         copyButton.setOnClickListener(v -> copyDiagnostic());
@@ -254,7 +271,7 @@ public class MainActivity extends Activity {
             }
 
             StringBuilder out = new StringBuilder();
-            out.append("Pocket Control 0.6\n");
+            out.append("Pocket Control 0.7\n");
             out.append("Android: ").append(Build.VERSION.RELEASE)
                     .append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
             out.append("Aparelho: ").append(Build.MANUFACTURER)
@@ -410,7 +427,7 @@ public class MainActivity extends Activity {
             accessoryOutput = new FileOutputStream(accessoryDescriptor.getFileDescriptor());
 
             appendEvent("Canal USB Accessory aberto. fd=" + accessoryDescriptor.getFd());
-            appendEvent("0.6: nenhum comando é enviado automaticamente. O botão TX envia apenas uma consulta de leitura.");
+            appendEvent("0.7: nenhum comando é enviado automaticamente. Você pode consultar ou trocar somente o modo FOTO/VÍDEO.");
             statusView.setText("🟢 Osmo detectada — canal aberto");
             refreshUsb();
         } catch (Throwable t) {
@@ -427,6 +444,283 @@ public class MainActivity extends Activity {
      * Envia somente CAMERA / Camera Work Mode Get (cmd set 0x02, cmd 0x11).
      * Este comando é de consulta e não altera configuração, gravação ou gimbal.
      */
+    /**
+     * Troca somente o modo de trabalho da câmera:
+     * 0 = TAKEPHOTO, 1 = RECORD.
+     * Não inicia captura nem gravação.
+     */
+    private synchronized void sendSetCameraMode(final int mode) {
+        if (mode != 0 && mode != 1) {
+            appendEvent("Modo recusado pelo app: " + mode);
+            return;
+        }
+
+        if (listening) {
+            Toast.makeText(this,
+                    "Espere o teste/escuta atual terminar.",
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        if (accessoryDescriptor == null || accessoryOutput == null || accessoryInput == null) {
+            openFirstAccessory();
+            if (accessoryDescriptor == null || accessoryOutput == null || accessoryInput == null) {
+                appendEvent("Mudança de modo cancelada: canal USB indisponível.");
+                return;
+            }
+        }
+
+        final int seq = nextTxSequence & 0xFFFF;
+        nextTxSequence = (nextTxSequence + 1) & 0xFFFF;
+        if (nextTxSequence == 0) nextTxSequence = 1;
+
+        try {
+            byte[] payload = new byte[]{(byte) (mode & 0xFF)};
+
+            // Sender App (2) -> Camera (1)
+            // cmd set Camera 0x02 / Camera Work Mode Set 0x10
+            byte[] duml = buildDumlPacket(
+                    0x02, 0x01, seq,
+                    0, 2, 0,
+                    0x02, 0x10,
+                    payload);
+
+            byte[] transport = wrapPocketTransport(duml);
+            accessoryOutput.write(transport);
+            accessoryOutput.flush();
+
+            appendEvent("TX: Camera Work Mode Set → "
+                    + cameraModeName(mode)
+                    + " (0x02/0x10), seq=" + seq);
+            appendEvent("DUML TX: " + toHex(duml));
+            statusView.setText("📤 Alterando para " + cameraModeName(mode) + "...");
+
+            listenForSetModeResponse(seq, mode, 2600L);
+
+        } catch (Throwable t) {
+            appendEvent("Falha ao trocar modo: " + t.getClass().getSimpleName()
+                    + " - " + safe(t.getMessage()));
+            statusView.setText("❌ Falha ao trocar modo");
+        }
+    }
+
+    private void listenForSetModeResponse(
+            final int expectedSeq,
+            final int requestedMode,
+            final long timeoutMs) {
+
+        if (listening) return;
+        listening = true;
+
+        listenThread = new Thread(() -> {
+            ByteArrayOutputStream rx = new ByteArrayOutputStream();
+            long deadline = System.currentTimeMillis() + timeoutMs;
+            byte[] buffer = new byte[4096];
+
+            try {
+                StructPollfd pollfd = new StructPollfd();
+                pollfd.fd = accessoryDescriptor.getFileDescriptor();
+                pollfd.events = (short) OsConstants.POLLIN;
+                StructPollfd[] pollfds = new StructPollfd[]{pollfd};
+
+                while (listening && System.currentTimeMillis() < deadline) {
+                    pollfd.revents = 0;
+                    int ready = Os.poll(pollfds, 120);
+
+                    if (!listening) break;
+
+                    if (ready > 0 && (pollfd.revents & OsConstants.POLLIN) != 0) {
+                        int count = accessoryInput.read(buffer);
+                        if (count < 0) break;
+                        if (count > 0) {
+                            rx.write(buffer, 0, count);
+                            if (rx.size() >= 49152) break;
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                appendEventFromWorker("Erro aguardando ACK de modo: "
+                        + t.getClass().getSimpleName() + " - " + safe(t.getMessage()));
+            } finally {
+                listening = false;
+
+                final byte[] received = rx.toByteArray();
+                final String ack = findGenericResponse(
+                        received, expectedSeq, 0x02, 0x10);
+
+                // Também procuramos o push 0x80 para ver o modo realmente anunciado.
+                final int pushedMode = findLastCameraStateMode(received);
+
+                runOnUiThread(() -> {
+                    appendEvent("RESULTADO DA TROCA DE MODO\\n"
+                            + "Solicitado: " + cameraModeName(requestedMode)
+                            + " (" + requestedMode + ")\\n"
+                            + ack
+                            + "\\nModo visto no push 0x80: "
+                            + (pushedMode >= 0
+                                ? cameraModeName(pushedMode) + " (" + pushedMode + ")"
+                                : "não encontrado neste intervalo"));
+
+                    if (pushedMode == requestedMode) {
+                        statusView.setText("✅ Modo " + cameraModeName(requestedMode) + " confirmado");
+                    } else {
+                        statusView.setText("🟡 Comando enviado — confira o diagnóstico");
+                    }
+                });
+            }
+        }, "PocketSetModeResponse");
+
+        listenThread.start();
+    }
+
+    private String findGenericResponse(
+            byte[] data, int expectedSeq, int expectedCmdSet, int expectedCmdId) {
+
+        if (data == null || data.length == 0) {
+            return "ACK: nenhum byte recebido.";
+        }
+
+        int responseCount = 0;
+        StringBuilder matches = new StringBuilder();
+
+        int pos = 0;
+        while (pos + 8 <= data.length) {
+            if (!looksLikePocketTransportHeader(data, pos)) {
+                pos++;
+                continue;
+            }
+
+            long outerLenLong = readLe32(data, pos + 4);
+            if (outerLenLong < 0 || outerLenLong > Integer.MAX_VALUE) {
+                pos++;
+                continue;
+            }
+
+            int outerLen = (int) outerLenLong;
+            int payloadStart = pos + 8;
+            int payloadEnd = Math.min(data.length, payloadStart + outerLen);
+
+            int p = payloadStart;
+            while (p + 13 <= payloadEnd) {
+                if ((data[p] & 0xFF) != 0x55) {
+                    p++;
+                    continue;
+                }
+
+                int frameLength =
+                        (data[p + 1] & 0xFF) | ((data[p + 2] & 0x03) << 8);
+                if (frameLength < 13 || p + frameLength > payloadEnd) {
+                    p++;
+                    continue;
+                }
+
+                int seq = (data[p + 6] & 0xFF) | ((data[p + 7] & 0xFF) << 8);
+                int cmdType = data[p + 8] & 0xFF;
+                int packetType = (cmdType >> 7) & 0x01;
+                int cmdSet = data[p + 9] & 0xFF;
+                int cmdId = data[p + 10] & 0xFF;
+                int innerLen = frameLength - 13;
+                int innerStart = p + 11;
+
+                if (packetType == 1
+                        && seq == expectedSeq
+                        && cmdSet == expectedCmdSet
+                        && cmdId == expectedCmdId) {
+
+                    responseCount++;
+                    byte[] payload = new byte[Math.max(0, innerLen)];
+                    if (innerLen > 0) {
+                        System.arraycopy(data, innerStart, payload, 0, innerLen);
+                    }
+
+                    matches.append("ACK #").append(responseCount)
+                            .append(": payload ")
+                            .append(payload.length == 0 ? "(vazio)" : toHex(payload));
+
+                    if (payload.length > 0) {
+                        matches.append(" | status provável=")
+                                .append(payload[0] & 0xFF);
+                    }
+                    matches.append("\\n");
+                }
+
+                p += frameLength;
+            }
+
+            if (payloadStart + outerLen <= data.length) {
+                pos = payloadStart + outerLen;
+            } else {
+                break;
+            }
+        }
+
+        if (responseCount == 0) {
+            return "ACK: não localizado para seq=" + expectedSeq
+                    + ", cmd 0x" + hex2(expectedCmdSet)
+                    + "/0x" + hex2(expectedCmdId) + ".";
+        }
+
+        return "ACK correspondente encontrado: " + responseCount + "\\n" + matches;
+    }
+
+    private int findLastCameraStateMode(byte[] data) {
+        if (data == null || data.length == 0) return -1;
+
+        int lastMode = -1;
+        int pos = 0;
+
+        while (pos + 8 <= data.length) {
+            if (!looksLikePocketTransportHeader(data, pos)) {
+                pos++;
+                continue;
+            }
+
+            long outerLenLong = readLe32(data, pos + 4);
+            if (outerLenLong < 0 || outerLenLong > Integer.MAX_VALUE) {
+                pos++;
+                continue;
+            }
+
+            int outerLen = (int) outerLenLong;
+            int payloadStart = pos + 8;
+            int payloadEnd = Math.min(data.length, payloadStart + outerLen);
+
+            int p = payloadStart;
+            while (p + 13 <= payloadEnd) {
+                if ((data[p] & 0xFF) != 0x55) {
+                    p++;
+                    continue;
+                }
+
+                int frameLength =
+                        (data[p + 1] & 0xFF) | ((data[p + 2] & 0x03) << 8);
+                if (frameLength < 13 || p + frameLength > payloadEnd) {
+                    p++;
+                    continue;
+                }
+
+                int cmdSet = data[p + 9] & 0xFF;
+                int cmdId = data[p + 10] & 0xFF;
+                int innerLen = frameLength - 13;
+                int innerStart = p + 11;
+
+                if (cmdSet == 0x02 && cmdId == 0x80 && innerLen >= 5) {
+                    lastMode = data[innerStart + 4] & 0xFF;
+                }
+
+                p += frameLength;
+            }
+
+            if (payloadStart + outerLen <= data.length) {
+                pos = payloadStart + outerLen;
+            } else {
+                break;
+            }
+        }
+
+        return lastMode;
+    }
+
     private synchronized void sendReadOnlyCameraModeQuery() {
         if (listening) {
             Toast.makeText(this,
@@ -1209,7 +1503,7 @@ public class MainActivity extends Activity {
                     .append(entry.getKey()).append("\n");
         }
 
-        out.append("\n0.6 mantém a escuta passiva e adiciona apenas um botão TX de CONSULTA (Camera Work Mode Get).");
+        out.append("\n0.7 adiciona troca controlada FOTO/VÍDEO (Camera Work Mode Set). Não inicia foto nem gravação.");
 
         return out.toString();
     }
