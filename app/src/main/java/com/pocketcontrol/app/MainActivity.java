@@ -156,7 +156,7 @@ public class MainActivity extends Activity {
         root.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("Pocket Control 0.3");
+        title.setText("Pocket Control 0.4");
         title.setTextSize(24f);
         title.setGravity(Gravity.CENTER_HORIZONTAL);
         root.addView(title, new LinearLayout.LayoutParams(
@@ -246,7 +246,7 @@ public class MainActivity extends Activity {
             }
 
             StringBuilder out = new StringBuilder();
-            out.append("Pocket Control 0.3\n");
+            out.append("Pocket Control 0.4\n");
             out.append("Android: ").append(Build.VERSION.RELEASE)
                     .append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
             out.append("Aparelho: ").append(Build.MANUFACTURER)
@@ -493,9 +493,7 @@ public class MainActivity extends Activity {
                             byte[] packet = new byte[count];
                             System.arraycopy(buffer, 0, packet, 0, count);
                             captureBuffer.write(packet, 0, packet.length);
-                            appendEventFromWorker("RX #" + chunks + " — " + count
-                                    + " bytes\nHEX: " + toHex(packet)
-                                    + "\nASCII: " + toAscii(packet));
+                            appendEventFromWorker("RX #" + chunks + " — " + count + " bytes");
 
                             if (total >= 65536) {
                                 appendEventFromWorker("Limite de captura atingido (64 KiB).");
@@ -544,154 +542,267 @@ public class MainActivity extends Activity {
 
 
     private String analyzeCapture(byte[] data) {
-        StringBuilder out = new StringBuilder();
-
         if (data == null || data.length == 0) {
             return "Nenhum byte disponível para análise.";
         }
 
-        out.append("Total capturado: ").append(data.length).append(" bytes\n");
-        out.append("Primeiros bytes: ")
-                .append(toHexRange(data, 0, Math.min(data.length, 96)))
-                .append("\n\n");
+        HashMap<String, Integer> commandCounts = new HashMap<>();
 
         int outerCount = 0;
-        int parsedFrames = 0;
+        int frameCount = 0;
         int pos = 0;
 
+        boolean haveCameraState = false;
+        int cameraFlags = 0;
+        int cameraMode = -1;
+        int cameraRecordState = -1;
+        boolean cameraSdInserted = false;
+        int cameraSdState = -1;
+
+        boolean haveGimbal = false;
+        double gimbalPitch = 0.0;
+        double gimbalRoll = 0.0;
+        double gimbalYaw = 0.0;
+        int gimbalMode = -1;
+
         while (pos + 8 <= data.length) {
-            if (looksLikePocketTransportHeader(data, pos)) {
-                long payloadLengthLong = readLe32(data, pos + 4);
-                if (payloadLengthLong < 0 || payloadLengthLong > Integer.MAX_VALUE) {
-                    out.append("Bloco externo inválido em offset ").append(pos)
-                            .append(": tamanho fora do intervalo.\n");
-                    pos++;
-                    continue;
-                }
-
-                int payloadLength = (int) payloadLengthLong;
-                int payloadStart = pos + 8;
-                int available = data.length - payloadStart;
-
-                outerCount++;
-                out.append("BLOCO EXTERNO #").append(outerCount)
-                        .append(" offset=").append(pos)
-                        .append(" magic=55 CC 49 57")
-                        .append(" payload=").append(payloadLength)
-                        .append(" bytes");
-
-                if (payloadLength > available) {
-                    out.append(" — INCOMPLETO; disponíveis ")
-                            .append(available).append("\n");
-                    parsedFrames += parseDumlFrames(
-                            data, payloadStart, data.length, out, outerCount);
-                    break;
-                } else {
-                    out.append(" — COMPLETO\n");
-                    parsedFrames += parseDumlFrames(
-                            data, payloadStart, payloadStart + payloadLength, out, outerCount);
-                    pos = payloadStart + payloadLength;
-                    continue;
-                }
+            if (!looksLikePocketTransportHeader(data, pos)) {
+                pos++;
+                continue;
             }
-            pos++;
+
+            long payloadLengthLong = readLe32(data, pos + 4);
+            if (payloadLengthLong < 0 || payloadLengthLong > Integer.MAX_VALUE) {
+                pos++;
+                continue;
+            }
+
+            int payloadLength = (int) payloadLengthLong;
+            int payloadStart = pos + 8;
+            int payloadEnd = payloadStart + payloadLength;
+
+            if (payloadEnd > data.length) {
+                payloadEnd = data.length;
+            }
+
+            outerCount++;
+
+            int p = payloadStart;
+            while (p + 13 <= payloadEnd) {
+                if ((data[p] & 0xFF) != 0x55) {
+                    p++;
+                    continue;
+                }
+
+                int b1 = data[p + 1] & 0xFF;
+                int b2 = data[p + 2] & 0xFF;
+                int frameLength = b1 | ((b2 & 0x03) << 8);
+
+                if (frameLength < 13 || p + frameLength > payloadEnd) {
+                    p++;
+                    continue;
+                }
+
+                int sender = data[p + 4] & 0xFF;
+                int receiver = data[p + 5] & 0xFF;
+                int cmdSet = data[p + 9] & 0xFF;
+                int cmdId = data[p + 10] & 0xFF;
+                int innerPayloadStart = p + 11;
+                int innerPayloadLength = frameLength - 13;
+
+                frameCount++;
+
+                String key = sourceName(sender)
+                        + " → " + sourceName(receiver)
+                        + " | " + commandName(cmdSet, cmdId)
+                        + " [set 0x" + hex2(cmdSet)
+                        + ", id 0x" + hex2(cmdId) + "]";
+
+                Integer oldCount = commandCounts.get(key);
+                commandCounts.put(key, oldCount == null ? 1 : oldCount + 1);
+
+                // Camera State Info / status push.
+                if (cmdSet == 0x02 && cmdId == 0x80 && innerPayloadLength >= 5) {
+                    cameraFlags = readLe32Int(data, innerPayloadStart);
+                    cameraMode = data[innerPayloadStart + 4] & 0xFF;
+                    cameraRecordState = (cameraFlags >> 6) & 0x03;
+                    cameraSdInserted = (cameraFlags & 0x0200) != 0;
+                    cameraSdState = (cameraFlags >> 10) & 0x0F;
+                    haveCameraState = true;
+                }
+
+                // Gimbal Params / push position.
+                if (cmdSet == 0x04 && cmdId == 0x05 && innerPayloadLength >= 7) {
+                    int pitchRaw = readLe16Signed(data, innerPayloadStart);
+                    int rollRaw = readLe16Signed(data, innerPayloadStart + 2);
+                    int yawRaw = readLe16Signed(data, innerPayloadStart + 4);
+                    int modeByte = data[innerPayloadStart + 6] & 0xFF;
+
+                    gimbalPitch = pitchRaw / 10.0;
+                    gimbalRoll = rollRaw / 10.0;
+                    gimbalYaw = yawRaw / 10.0;
+                    gimbalMode = (modeByte >> 6) & 0x03;
+                    haveGimbal = true;
+                }
+
+                p += frameLength;
+            }
+
+            if (payloadStart + payloadLength <= data.length) {
+                pos = payloadStart + payloadLength;
+            } else {
+                break;
+            }
         }
 
-        if (outerCount == 0) {
-            out.append("Nenhum cabeçalho externo 55 CC 49 57 encontrado; ")
-                    .append("tentando localizar quadros 0x55 diretamente.\n");
-            parsedFrames += parseDumlFrames(data, 0, data.length, out, 0);
+        StringBuilder out = new StringBuilder();
+        out.append("Total capturado: ").append(data.length).append(" bytes\n");
+        out.append("Blocos USB DJI completos/parciais encontrados: ")
+                .append(outerCount).append("\n");
+        out.append("Quadros DUML completos encontrados: ")
+                .append(frameCount).append("\n\n");
+
+        if (haveCameraState) {
+            out.append("=== ESTADO DA CÂMERA ===\n");
+            out.append("Modo: ").append(cameraModeName(cameraMode))
+                    .append(" (").append(cameraMode).append(")\n");
+            out.append("Estado de gravação (bits): ")
+                    .append(cameraRecordState).append("\n");
+            out.append("Cartão SD detectado: ")
+                    .append(cameraSdInserted ? "SIM" : "NÃO").append("\n");
+            out.append("Estado SD (valor): ")
+                    .append(cameraSdState).append("\n");
+            out.append("Flags brutas: 0x")
+                    .append(String.format(Locale.US, "%08X", cameraFlags))
+                    .append("\n\n");
         }
 
-        out.append("\nResumo: ")
-                .append(outerCount).append(" bloco(s) externo(s), ")
-                .append(parsedFrames).append(" quadro(s) candidato(s) DJI.\n");
+        if (haveGimbal) {
+            out.append("=== ESTADO DO GIMBAL ===\n");
+            out.append(String.format(Locale.US,
+                    "Pitch: %.1f° | Roll: %.1f° | Yaw: %.1f°\n",
+                    gimbalPitch, gimbalRoll, gimbalYaw));
+            out.append("Modo: ").append(gimbalModeName(gimbalMode))
+                    .append(" (").append(gimbalMode).append(")\n\n");
+        }
 
-        out.append("Observação: nesta versão apenas analisamos os bytes recebidos; ")
-                .append("nenhum comando é enviado à câmera.");
+        out.append("=== MENSAGENS OBSERVADAS ===\n");
+        for (java.util.Map.Entry<String, Integer> entry : commandCounts.entrySet()) {
+            out.append(entry.getValue()).append("x  ")
+                    .append(entry.getKey()).append("\n");
+        }
+
+        out.append("\nNesta versão continuamos apenas lendo dados; ")
+                .append("nenhum comando é enviado à Osmo.");
 
         return out.toString();
     }
 
-    private int parseDumlFrames(
-            byte[] data, int start, int end, StringBuilder out, int outerIndex) {
+    private int readLe32Int(byte[] data, int offset) {
+        if (offset < 0 || offset + 4 > data.length) return 0;
+        return (data[offset] & 0xFF)
+                | ((data[offset + 1] & 0xFF) << 8)
+                | ((data[offset + 2] & 0xFF) << 16)
+                | ((data[offset + 3] & 0xFF) << 24);
+    }
 
-        int count = 0;
-        int p = start;
+    private int readLe16Signed(byte[] data, int offset) {
+        if (offset < 0 || offset + 2 > data.length) return 0;
+        int value = (data[offset] & 0xFF) | ((data[offset + 1] & 0xFF) << 8);
+        if ((value & 0x8000) != 0) value -= 0x10000;
+        return value;
+    }
 
-        while (p + 4 <= end) {
-            if ((data[p] & 0xFF) != 0x55) {
-                p++;
-                continue;
+    private String sourceName(int id) {
+        switch (id & 0x1F) {
+            case 1: return "Câmera";
+            case 2: return "App";
+            case 4: return "Gimbal";
+            case 5: return "Placa central";
+            default: return "Módulo 0x" + hex2(id);
+        }
+    }
+
+    private String commandName(int cmdSet, int cmdId) {
+        if (cmdSet == 0x02) {
+            switch (cmdId) {
+                case 0x01: return "Capturar foto";
+                case 0x02: return "Gravar vídeo";
+                case 0x10: return "Definir modo da câmera";
+                case 0x11: return "Ler modo da câmera";
+                case 0x18: return "Definir formato de vídeo";
+                case 0x19: return "Ler formato de vídeo";
+                case 0x28: return "Definir obturador";
+                case 0x29: return "Ler obturador";
+                case 0x2A: return "Definir ISO";
+                case 0x2B: return "Ler ISO";
+                case 0x2C: return "Definir balanço de branco";
+                case 0x2D: return "Ler balanço de branco";
+                case 0x2E: return "Definir EV";
+                case 0x2F: return "Ler EV";
+                case 0x60: return "Definir histograma";
+                case 0x61: return "Ler histograma";
+                case 0x70: return "Ler estado do sistema";
+                case 0x71: return "Ler cartão SD";
+                case 0x7C: return "Comando do obturador";
+                case 0x80: return "Estado da câmera";
+                case 0x81: return "Parâmetros de captura";
+                case 0x83: return "Dados do histograma";
+                case 0x87: return "Informações de captura/lente";
+                case 0x88: return "Parâmetros de timelapse";
+                case 0x8A: return "Parâmetros de FOV";
+                default: return "Câmera cmd 0x" + hex2(cmdId);
             }
-
-            int b1 = data[p + 1] & 0xFF;
-            int b2 = data[p + 2] & 0xFF;
-
-            // Estrutura observada nos quadros DJI:
-            // byte 1 = 8 bits baixos do tamanho
-            // bits 0..1 do byte 2 = 2 bits altos do tamanho
-            // bits 2..7 do byte 2 = versão
-            int frameLength = b1 | ((b2 & 0x03) << 8);
-            int version = (b2 >> 2) & 0x3F;
-
-            if (frameLength < 13 || frameLength > 1023) {
-                p++;
-                continue;
-            }
-
-            if (p + frameLength > end) {
-                out.append("  Quadro candidato em offset ").append(p)
-                        .append(" len=").append(frameLength)
-                        .append(" ver=").append(version)
-                        .append(" — incompleto neste bloco\n");
-                break;
-            }
-
-            count++;
-
-            int sender = data[p + 4] & 0xFF;
-            int receiver = data[p + 5] & 0xFF;
-            int sequence = (data[p + 6] & 0xFF) | ((data[p + 7] & 0xFF) << 8);
-            int flags = data[p + 8] & 0xFF;
-            int cmdSet = data[p + 9] & 0xFF;
-            int cmdId = data[p + 10] & 0xFF;
-            int payloadLength = frameLength - 13;
-
-            out.append("  FRAME #").append(count);
-            if (outerIndex > 0) {
-                out.append(" [bloco ").append(outerIndex).append("]");
-            }
-            out.append(" offset=").append(p)
-                    .append(" len=").append(frameLength)
-                    .append(" ver=").append(version)
-                    .append(" hdrCRC=0x").append(hex2(data[p + 3] & 0xFF))
-                    .append(" src=0x").append(hex2(sender))
-                    .append(" dst=0x").append(hex2(receiver))
-                    .append(" seq=").append(sequence)
-                    .append(" flags=0x").append(hex2(flags))
-                    .append(" cmdSet=0x").append(hex2(cmdSet))
-                    .append(" cmdId=0x").append(hex2(cmdId))
-                    .append(" payload=").append(payloadLength)
-                    .append(" bytes\n");
-
-            if (payloadLength > 0) {
-                int payloadStart = p + 11;
-                int previewLength = Math.min(payloadLength, 32);
-                out.append("    Payload: ")
-                        .append(toHexRange(data, payloadStart, previewLength));
-                if (payloadLength > previewLength) {
-                    out.append(" ... (+")
-                            .append(payloadLength - previewLength)
-                            .append(" bytes)");
-                }
-                out.append("\n");
-            }
-
-            p += frameLength;
         }
 
-        return count;
+        if (cmdSet == 0x04) {
+            switch (cmdId) {
+                case 0x01: return "Controle do gimbal";
+                case 0x05: return "Posição/estado do gimbal";
+                case 0x0A: return "Controle por ângulo";
+                case 0x0C: return "Controle por velocidade";
+                case 0x14: return "Controle de ângulo absoluto";
+                case 0x15: return "Movimento do gimbal";
+                case 0x1C: return "Tipo do gimbal";
+                case 0x27: return "Estado anormal do gimbal";
+                case 0x33: return "Bateria do gimbal";
+                case 0x37: return "Parâmetros de timelapse do gimbal";
+                case 0x38: return "Estado de timelapse do gimbal";
+                case 0x4C: return "Reset/Modo do gimbal";
+                case 0x57: return "Estado do joystick";
+                case 0x58: return "Controle do joystick";
+                default: return "Gimbal cmd 0x" + hex2(cmdId);
+            }
+        }
+
+        if (cmdSet == 0x00) return "Geral cmd 0x" + hex2(cmdId);
+        if (cmdSet == 0x05) return "Placa central cmd 0x" + hex2(cmdId);
+
+        return "CmdSet 0x" + hex2(cmdSet) + " cmd 0x" + hex2(cmdId);
+    }
+
+    private String cameraModeName(int mode) {
+        switch (mode) {
+            case 0: return "FOTO";
+            case 1: return "VÍDEO";
+            case 2: return "PLAYBACK";
+            case 3: return "TRANSCODE";
+            case 4: return "AJUSTE";
+            case 5: return "ECONOMIA";
+            case 6: return "DOWNLOAD";
+            case 7: return "NOVO PLAYBACK";
+            default: return "DESCONHECIDO";
+        }
+    }
+
+    private String gimbalModeName(int mode) {
+        switch (mode) {
+            case 0: return "Yaw sem Follow";
+            case 1: return "FPV";
+            case 2: return "Follow";
+            case 3: return "Auto calibração";
+            default: return "Desconhecido";
+        }
     }
 
     private boolean looksLikePocketTransportHeader(byte[] data, int offset) {
