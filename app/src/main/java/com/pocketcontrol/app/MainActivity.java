@@ -14,6 +14,8 @@ import android.hardware.usb.UsbManager;
 import android.media.MediaCodec;
 import android.media.MediaFormat;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
 import android.view.Gravity;
@@ -35,9 +37,9 @@ import java.util.Arrays;
 import java.util.Locale;
 
 /**
- * Pocket Control 1.4
+ * Pocket Control 1.5
  *
- * Base do aplicativo "de uso real":
+ * Base estabilizada do aplicativo de uso real:
  * - conexão automática com DJI HG210 / Osmo Pocket 1;
  * - leitor USB contínuo;
  * - roteador LogicLink 0x5749 (controle) / 0x574A (vídeo);
@@ -73,6 +75,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private int nextTxSequence = 1;
 
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private volatile boolean connecting = false;
+    private volatile boolean destroyed = false;
+    private int connectionGeneration = 0;
+    private UsbAccessory currentAccessory;
+
     // UI
     private TextView connectionView;
     private TextView cameraStateView;
@@ -99,31 +107,54 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private final H264AnnexBCollector h264Collector = new H264AnnexBCollector();
     private H264Decoder h264Decoder;
 
-    private final BroadcastReceiver usbPermissionReceiver = new BroadcastReceiver() {
+    private final BroadcastReceiver usbReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            if (!ACTION_USB_PERMISSION.equals(intent.getAction())) return;
+            String action = intent.getAction();
 
-            boolean granted = intent.getBooleanExtra(
-                    UsbManager.EXTRA_PERMISSION_GRANTED, false);
+            if (ACTION_USB_PERMISSION.equals(action)) {
+                boolean granted = intent.getBooleanExtra(
+                        UsbManager.EXTRA_PERMISSION_GRANTED, false);
 
-            UsbAccessory accessory = null;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                accessory = intent.getParcelableExtra(
-                        UsbManager.EXTRA_ACCESSORY, UsbAccessory.class);
-            } else {
-                accessory = intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY);
+                UsbAccessory accessory = getAccessoryFromIntent(intent);
+
+                if (granted && accessory != null) {
+                    appendLog("Permissão USB concedida.");
+                    openAccessory(accessory);
+                } else {
+                    connecting = false;
+                    appendLog("Permissão USB negada.");
+                    setConnectionStatus("Permissão USB necessária", false);
+                }
+                return;
             }
 
-            if (granted && accessory != null) {
-                appendLog("Permissão USB concedida.");
-                openAccessory(accessory);
-            } else {
-                appendLog("Permissão USB negada.");
-                setConnectionStatus("Permissão USB necessária", false);
+            if (UsbManager.ACTION_USB_ACCESSORY_DETACHED.equals(action)) {
+                UsbAccessory detached = getAccessoryFromIntent(intent);
+
+                if (detached == null
+                        || currentAccessory == null
+                        || detached.equals(currentAccessory)) {
+                    appendLog("Osmo desconectada / USB reenumerado.");
+                    closeAccessory();
+                    cameraStateView.setText("Pocket desconectada.");
+                    videoStateView.setText("LIVE VIEW: aguardando HG210");
+                }
             }
         }
     };
+
+    private UsbAccessory getAccessoryFromIntent(Intent intent) {
+        if (intent == null) return null;
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            return intent.getParcelableExtra(
+                    UsbManager.EXTRA_ACCESSORY,
+                    UsbAccessory.class);
+        }
+
+        return intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY);
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -137,13 +168,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         h264Decoder = new H264Decoder();
 
-        autoConnectPocket();
+        mainHandler.postDelayed(this::autoConnectPocket, 300);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        autoConnectPocket();
+
+        if (!destroyed) {
+            mainHandler.postDelayed(this::autoConnectPocket, 250);
+        }
     }
 
     @Override
@@ -151,11 +185,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         super.onNewIntent(intent);
         setIntent(intent);
         appendLog("Evento USB: " + safe(intent.getAction()));
-        autoConnectPocket();
+
+        if (!destroyed) {
+            mainHandler.postDelayed(this::autoConnectPocket, 180);
+        }
     }
 
     @Override
     protected void onDestroy() {
+        destroyed = true;
+        mainHandler.removeCallbacksAndMessages(null);
+
         stopReader();
         closeAccessory();
 
@@ -165,7 +205,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         if (receiverRegistered) {
             try {
-                unregisterReceiver(usbPermissionReceiver);
+                unregisterReceiver(usbReceiver);
             } catch (Throwable ignored) {
             }
         }
@@ -250,8 +290,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         placeholder.setText(
                 "OSMO POCKET 1\n\n" +
                 "Canal de controle: pronto\n" +
+                "Conexão AOA: estabilizada\n" +
                 "Decoder H.264: pronto\n\n" +
-                "Aguardando ativação do stream HG210");
+                "Aguardando bootstrap de vídeo HG210");
         placeholder.setTextColor(Color.GRAY);
         placeholder.setTextSize(16f);
         placeholder.setGravity(Gravity.CENTER);
@@ -345,9 +386,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         Button reconnectButton = new Button(this);
         reconnectButton.setText("RECONECTAR");
         reconnectButton.setOnClickListener(v -> {
-            stopReader();
+            appendLog("Reconexão manual solicitada.");
             closeAccessory();
-            autoConnectPocket();
+            scheduleReconnect(500);
         });
         logActions.addView(reconnectButton, new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
@@ -379,7 +420,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
 
         String text =
-                "Pocket Control 1.4\n" +
+                "Pocket Control 1.5\n" +
                 "Android " + Build.VERSION.RELEASE +
                 " / " + Build.MANUFACTURER + " " + Build.MODEL + "\n\n" +
                 log;
@@ -437,22 +478,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void registerPermissionReceiver() {
-        IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(ACTION_USB_PERMISSION);
+        filter.addAction(UsbManager.ACTION_USB_ACCESSORY_DETACHED);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(
-                    usbPermissionReceiver,
+                    usbReceiver,
                     filter,
                     Context.RECEIVER_NOT_EXPORTED);
         } else {
-            registerReceiver(usbPermissionReceiver, filter);
+            registerReceiver(usbReceiver, filter);
         }
 
         receiverRegistered = true;
     }
 
-    private void autoConnectPocket() {
-        if (accessoryDescriptor != null) return;
+    private synchronized void autoConnectPocket() {
+        if (destroyed) return;
+
+        if (accessoryDescriptor != null || connecting) {
+            return;
+        }
 
         UsbAccessory[] list = usbManager.getAccessoryList();
 
@@ -477,9 +524,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             return;
         }
 
-        appendLog("HG210 encontrada: " +
-                safe(target.getManufacturer()) + " / " +
-                safe(target.getModel()));
+        connecting = true;
+
+        appendLog("HG210 encontrada: "
+                + safe(target.getManufacturer()) + " / "
+                + safe(target.getModel()));
 
         if (usbManager.hasPermission(target)) {
             openAccessory(target);
@@ -490,69 +539,126 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private synchronized void openAccessory(UsbAccessory accessory) {
-        if (accessoryDescriptor != null) return;
+        if (destroyed) {
+            connecting = false;
+            return;
+        }
+
+        if (accessoryDescriptor != null) {
+            connecting = false;
+            return;
+        }
 
         try {
-            accessoryDescriptor = usbManager.openAccessory(accessory);
+            ParcelFileDescriptor descriptor =
+                    usbManager.openAccessory(accessory);
 
-            if (accessoryDescriptor == null) {
+            if (descriptor == null) {
+                connecting = false;
                 appendLog("openAccessory() retornou null.");
                 setConnectionStatus("FALHA USB", false);
+                scheduleReconnect(800);
                 return;
             }
 
+            accessoryDescriptor = descriptor;
             accessoryInput =
-                    new FileInputStream(accessoryDescriptor.getFileDescriptor());
+                    new FileInputStream(descriptor.getFileDescriptor());
             accessoryOutput =
-                    new FileOutputStream(accessoryDescriptor.getFileDescriptor());
+                    new FileOutputStream(descriptor.getFileDescriptor());
+
+            currentAccessory = accessory;
+            connectionGeneration++;
+            connecting = false;
+
+            logicLinkPending = new byte[0];
+            currentCameraMode = -1;
+            dumlPackets = 0;
+            videoPackets = 0;
+            videoBytes = 0;
 
             setConnectionStatus("HG210 CONECTADA", true);
             cameraStateView.setText("Osmo conectada. Lendo estado...");
-            appendLog("Canal AOA aberto. fd=" + accessoryDescriptor.getFd());
+            videoStateView.setText("LIVE VIEW: aguardando bootstrap HG210");
 
-            startReader();
+            appendLog("Canal AOA aberto. fd="
+                    + descriptor.getFd()
+                    + " geração=" + connectionGeneration);
+
+            startReader(connectionGeneration);
 
         } catch (Throwable t) {
-            appendLog("Erro abrindo AOA: " +
-                    t.getClass().getSimpleName() + " - " + safe(t.getMessage()));
+            connecting = false;
+
+            appendLog("Erro abrindo AOA: "
+                    + t.getClass().getSimpleName()
+                    + " - " + safe(t.getMessage()));
+
             closeAccessory();
+            scheduleReconnect(900);
         }
     }
 
     private synchronized void closeAccessory() {
-        stopReader();
+        readerRunning = false;
+        connecting = false;
 
-        try {
-            if (accessoryInput != null) accessoryInput.close();
-        } catch (Throwable ignored) {
-        }
-
-        try {
-            if (accessoryOutput != null) accessoryOutput.close();
-        } catch (Throwable ignored) {
-        }
-
-        try {
-            if (accessoryDescriptor != null) accessoryDescriptor.close();
-        } catch (Throwable ignored) {
-        }
+        FileInputStream input = accessoryInput;
+        FileOutputStream output = accessoryOutput;
+        ParcelFileDescriptor descriptor = accessoryDescriptor;
 
         accessoryInput = null;
         accessoryOutput = null;
         accessoryDescriptor = null;
+        currentAccessory = null;
 
         logicLinkPending = new byte[0];
 
+        try {
+            if (input != null) input.close();
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            if (output != null) output.close();
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            if (descriptor != null) descriptor.close();
+        } catch (Throwable ignored) {
+        }
+
         setConnectionStatus("DESCONECTADA", false);
+    }
+
+    private void scheduleReconnect(long delayMs) {
+        if (destroyed) return;
+
+        mainHandler.postDelayed(() -> {
+            if (!destroyed
+                    && accessoryDescriptor == null
+                    && !connecting) {
+                autoConnectPocket();
+            }
+        }, delayMs);
     }
 
     // -------------------------------------------------------------------------
     // Leitor contínuo LogicLink
     // -------------------------------------------------------------------------
 
-    private synchronized void startReader() {
-        if (readerRunning) return;
-        if (accessoryInput == null) return;
+    private synchronized void startReader(final int generation) {
+        if (readerRunning) {
+            appendLog("Leitor já ativo; novo start ignorado.");
+            return;
+        }
+
+        if (accessoryInput == null || accessoryDescriptor == null) {
+            return;
+        }
+
+        final FileInputStream inputForThisReader = accessoryInput;
 
         readerRunning = true;
 
@@ -560,33 +666,76 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             byte[] buffer = new byte[16 * 1024];
 
             try {
-                while (readerRunning && accessoryInput != null) {
-                    int count = accessoryInput.read(buffer);
+                while (readerRunning
+                        && generation == connectionGeneration
+                        && inputForThisReader == accessoryInput) {
 
-                    if (count < 0) break;
+                    int count = inputForThisReader.read(buffer);
+
+                    if (count < 0) {
+                        throw new java.io.IOException("EOF no canal AOA");
+                    }
+
                     if (count == 0) continue;
 
                     feedLogicLink(buffer, count);
                 }
 
             } catch (Throwable t) {
-                if (readerRunning) {
-                    appendLog("Leitor USB terminou: " +
-                            t.getClass().getSimpleName() + " - " +
-                            safe(t.getMessage()));
+                boolean stale =
+                        generation != connectionGeneration
+                        || inputForThisReader != accessoryInput
+                        || destroyed;
+
+                if (!stale) {
+                    appendLog("Leitor USB da geração "
+                            + generation
+                            + " terminou: "
+                            + t.getClass().getSimpleName()
+                            + " - " + safe(t.getMessage()));
+
+                    runOnUiThread(() -> {
+                        cameraStateView.setText(
+                                "USB interrompido. Reconectando...");
+                        videoStateView.setText(
+                                "LIVE VIEW: aguardando reconexão");
+                    });
+
+                    synchronized (MainActivity.this) {
+                        if (generation == connectionGeneration) {
+                            closeAccessory();
+                        }
+                    }
+
+                    scheduleReconnect(750);
                 }
+
             } finally {
-                readerRunning = false;
+                if (generation == connectionGeneration) {
+                    readerRunning = false;
+                }
             }
 
-        }, "PocketControl-LogicLinkReader");
+        }, "PocketControl-LogicLinkReader-" + generation);
 
         readerThread.start();
-        appendLog("Leitor LogicLink contínuo iniciado.");
+
+        appendLog("Leitor LogicLink contínuo iniciado. geração="
+                + generation);
     }
 
     private void stopReader() {
         readerRunning = false;
+
+        Thread t = readerThread;
+        readerThread = null;
+
+        if (t != null) {
+            try {
+                t.interrupt();
+            } catch (Throwable ignored) {
+            }
+        }
     }
 
     private void feedLogicLink(byte[] incoming, int length) {
