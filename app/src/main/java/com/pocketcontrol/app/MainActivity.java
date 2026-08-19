@@ -8,86 +8,120 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.graphics.Color;
 import android.hardware.usb.UsbAccessory;
-import android.hardware.usb.UsbConfiguration;
-import android.hardware.usb.UsbDevice;
-import android.hardware.usb.UsbDeviceConnection;
-import android.hardware.usb.UsbEndpoint;
-import android.hardware.usb.UsbInterface;
 import android.hardware.usb.UsbManager;
+import android.media.MediaCodec;
+import android.media.MediaFormat;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
-import android.os.Handler;
-import android.os.Looper;
-import android.system.Os;
-import android.system.OsConstants;
-import android.system.StructPollfd;
 import android.view.Gravity;
+import android.view.Surface;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
+import android.view.View;
 import android.widget.Button;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.io.ByteArrayOutputStream;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
-import java.io.IOException;
-import java.util.HashMap;
+import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.Locale;
 
-public class MainActivity extends Activity {
+/**
+ * Pocket Control 1.4
+ *
+ * Base do aplicativo "de uso real":
+ * - conexão automática com DJI HG210 / Osmo Pocket 1;
+ * - leitor USB contínuo;
+ * - roteador LogicLink 0x5749 (controle) / 0x574A (vídeo);
+ * - troca FOTO / VÍDEO já validada;
+ * - SurfaceView + MediaCodec preparados para H.264;
+ * - layout já com cara de câmera, não de diagnóstico.
+ *
+ * IMPORTANTE:
+ * O bootstrap específico que faz a HG210 começar a emitir o canal de vídeo
+ * ainda não foi identificado. Por isso este código NÃO inventa comandos.
+ * Quando 0x574A aparecer, o vídeo H.264 é encaminhado ao decoder.
+ */
+public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private static final String ACTION_USB_PERMISSION =
             "com.pocketcontrol.app.USB_PERMISSION";
 
-    private UsbManager usbManager;
-    private TextView statusView;
-    private TextView logView;
-    private PendingIntent permissionIntent;
-    private boolean receiverRegistered = false;
+    private static final int PORT_DUML  = 0x5749;
+    private static final int PORT_VIDEO = 0x574A;
 
-    private final StringBuilder eventLog = new StringBuilder();
-    private String baseDiagnostic = "";
-    private String lastDiagnostic = "";
+    private UsbManager usbManager;
+    private PendingIntent permissionIntent;
+    private boolean receiverRegistered;
 
     private ParcelFileDescriptor accessoryDescriptor;
     private FileInputStream accessoryInput;
     private FileOutputStream accessoryOutput;
-    private volatile boolean listening = false;
-    private Thread listenThread;
-    private final ByteArrayOutputStream captureBuffer = new ByteArrayOutputStream();
+
+    private volatile boolean readerRunning;
+    private Thread readerThread;
+
+    private byte[] logicLinkPending = new byte[0];
+
     private int nextTxSequence = 1;
-    private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private boolean autoConnectAttempted = false;
-    private boolean liveViewProbeDone = false;
+
+    // UI
+    private TextView connectionView;
+    private TextView cameraStateView;
+    private TextView videoStateView;
+    private TextView telemetryView;
+    private TextView logView;
+    private LinearLayout logPanel;
+    private SurfaceView previewView;
+    private Surface previewSurface;
+
+    private Button photoModeButton;
+    private Button videoModeButton;
+    private Button shutterButton;
+
+    private final StringBuilder log = new StringBuilder();
+
+    // Estado observado
+    private int currentCameraMode = -1;
+    private long dumlPackets = 0;
+    private long videoPackets = 0;
+    private long videoBytes = 0;
+
+    // H264
+    private final H264AnnexBCollector h264Collector = new H264AnnexBCollector();
+    private H264Decoder h264Decoder;
 
     private final BroadcastReceiver usbPermissionReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            if (!ACTION_USB_PERMISSION.equals(intent.getAction())) {
-                return;
-            }
+            if (!ACTION_USB_PERMISSION.equals(intent.getAction())) return;
 
             boolean granted = intent.getBooleanExtra(
                     UsbManager.EXTRA_PERMISSION_GRANTED, false);
 
-            UsbDevice device = getUsbDeviceExtra(intent);
-            UsbAccessory accessory = getUsbAccessoryExtra(intent);
-
-            if (granted) {
-                appendEvent("Permissão USB concedida pelo Android.");
-                if (accessory != null) {
-                    openAccessoryChannel(accessory);
-                } else if (device != null) {
-                    testOpenDevice(device);
-                }
+            UsbAccessory accessory = null;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                accessory = intent.getParcelableExtra(
+                        UsbManager.EXTRA_ACCESSORY, UsbAccessory.class);
             } else {
-                appendEvent("Permissão USB negada.");
+                accessory = intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY);
             }
 
-            refreshUsb();
+            if (granted && accessory != null) {
+                appendLog("Permissão USB concedida.");
+                openAccessory(accessory);
+            } else {
+                appendLog("Permissão USB negada.");
+                setConnectionStatus("Permissão USB necessária", false);
+            }
         }
     };
 
@@ -96,46 +130,299 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
 
         usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
+
         createPermissionIntent();
         registerPermissionReceiver();
-        buildUi();
-        refreshUsb();
-        mainHandler.postDelayed(this::autoConnectPocket, 350);
+        buildCameraUi();
+
+        h264Decoder = new H264Decoder();
+
+        autoConnectPocket();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (statusView != null) {
-            refreshUsb();
-            mainHandler.postDelayed(this::autoConnectPocket, 250);
-        }
+        autoConnectPocket();
     }
 
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-        appendEvent("Novo evento USB recebido: " + safe(intent.getAction()));
-        refreshUsb();
-        autoConnectAttempted = false;
-        liveViewProbeDone = false;
-        mainHandler.postDelayed(this::autoConnectPocket, 180);
+        appendLog("Evento USB: " + safe(intent.getAction()));
+        autoConnectPocket();
     }
 
     @Override
     protected void onDestroy() {
-        stopListening();
-        closeAccessoryChannel();
+        stopReader();
+        closeAccessory();
+
+        if (h264Decoder != null) {
+            h264Decoder.release();
+        }
 
         if (receiverRegistered) {
             try {
                 unregisterReceiver(usbPermissionReceiver);
-            } catch (Exception ignored) {
+            } catch (Throwable ignored) {
             }
         }
+
         super.onDestroy();
     }
+
+    // -------------------------------------------------------------------------
+    // UI
+    // -------------------------------------------------------------------------
+
+    private void buildCameraUi() {
+        getWindow().setStatusBarColor(Color.BLACK);
+        getWindow().setNavigationBarColor(Color.BLACK);
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(Color.BLACK);
+
+        // Top bar
+        LinearLayout topBar = new LinearLayout(this);
+        topBar.setOrientation(LinearLayout.HORIZONTAL);
+        topBar.setGravity(Gravity.CENTER_VERTICAL);
+        topBar.setPadding(dp(12), dp(8), dp(12), dp(8));
+        topBar.setBackgroundColor(Color.rgb(18, 18, 18));
+
+        TextView appName = new TextView(this);
+        appName.setText("Pocket Control");
+        appName.setTextColor(Color.WHITE);
+        appName.setTextSize(18f);
+        appName.setGravity(Gravity.CENTER_VERTICAL);
+        topBar.addView(appName, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        connectionView = new TextView(this);
+        connectionView.setText("DESCONECTADA");
+        connectionView.setTextColor(Color.LTGRAY);
+        connectionView.setTextSize(12f);
+        connectionView.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        topBar.addView(connectionView, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        root.addView(topBar);
+
+        // Preview area
+        FrameLayout previewFrame = new FrameLayout(this);
+        previewFrame.setBackgroundColor(Color.BLACK);
+
+        previewView = new SurfaceView(this);
+        previewView.getHolder().addCallback(this);
+        previewFrame.addView(previewView, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
+
+        // Overlay superior
+        LinearLayout overlayTop = new LinearLayout(this);
+        overlayTop.setOrientation(LinearLayout.VERTICAL);
+        overlayTop.setPadding(dp(12), dp(10), dp(12), dp(10));
+        overlayTop.setBackgroundColor(0x55000000);
+
+        cameraStateView = new TextView(this);
+        cameraStateView.setText("Aguardando câmera...");
+        cameraStateView.setTextColor(Color.WHITE);
+        cameraStateView.setTextSize(13f);
+        overlayTop.addView(cameraStateView);
+
+        videoStateView = new TextView(this);
+        videoStateView.setText("LIVE VIEW: aguardando bootstrap HG210");
+        videoStateView.setTextColor(Color.LTGRAY);
+        videoStateView.setTextSize(12f);
+        overlayTop.addView(videoStateView);
+
+        FrameLayout.LayoutParams overlayTopLp = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT);
+        overlayTopLp.gravity = Gravity.TOP;
+        previewFrame.addView(overlayTop, overlayTopLp);
+
+        // Texto central enquanto não há vídeo
+        TextView placeholder = new TextView(this);
+        placeholder.setText(
+                "OSMO POCKET 1\n\n" +
+                "Canal de controle: pronto\n" +
+                "Decoder H.264: pronto\n\n" +
+                "Aguardando ativação do stream HG210");
+        placeholder.setTextColor(Color.GRAY);
+        placeholder.setTextSize(16f);
+        placeholder.setGravity(Gravity.CENTER);
+
+        FrameLayout.LayoutParams placeholderLp = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT);
+        previewFrame.addView(placeholder, placeholderLp);
+
+        root.addView(previewFrame, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        // Telemetria
+        telemetryView = new TextView(this);
+        telemetryView.setText("DUML 0 | VIDEO 0");
+        telemetryView.setTextColor(Color.LTGRAY);
+        telemetryView.setTextSize(11f);
+        telemetryView.setGravity(Gravity.CENTER);
+        telemetryView.setPadding(dp(8), dp(4), dp(8), dp(4));
+        telemetryView.setBackgroundColor(Color.rgb(18, 18, 18));
+        root.addView(telemetryView);
+
+        // Mode row
+        LinearLayout modeRow = new LinearLayout(this);
+        modeRow.setOrientation(LinearLayout.HORIZONTAL);
+        modeRow.setPadding(dp(10), dp(8), dp(10), dp(4));
+        modeRow.setBackgroundColor(Color.rgb(14, 14, 14));
+
+        photoModeButton = new Button(this);
+        photoModeButton.setText("FOTO");
+        photoModeButton.setOnClickListener(v -> sendSetCameraMode(0));
+        modeRow.addView(photoModeButton, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        videoModeButton = new Button(this);
+        videoModeButton.setText("VÍDEO");
+        videoModeButton.setOnClickListener(v -> sendSetCameraMode(1));
+        modeRow.addView(videoModeButton, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        root.addView(modeRow);
+
+        // Main control row
+        LinearLayout controlRow = new LinearLayout(this);
+        controlRow.setOrientation(LinearLayout.HORIZONTAL);
+        controlRow.setGravity(Gravity.CENTER);
+        controlRow.setPadding(dp(10), dp(4), dp(10), dp(8));
+        controlRow.setBackgroundColor(Color.rgb(14, 14, 14));
+
+        Button settingsButton = new Button(this);
+        settingsButton.setText("ISO / EV / WB");
+        settingsButton.setEnabled(false);
+        controlRow.addView(settingsButton, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        shutterButton = new Button(this);
+        shutterButton.setText("●");
+        shutterButton.setTextSize(26f);
+        shutterButton.setEnabled(false);
+        shutterButton.setOnClickListener(v ->
+                Toast.makeText(this,
+                        "FOTO/REC será ativado depois de validar o payload.",
+                        Toast.LENGTH_SHORT).show());
+        controlRow.addView(shutterButton, new LinearLayout.LayoutParams(
+                0, dp(72), 1f));
+
+        Button debugButton = new Button(this);
+        debugButton.setText("LOG");
+        debugButton.setOnClickListener(v -> toggleLog());
+        controlRow.addView(debugButton, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        root.addView(controlRow);
+
+        // Log panel
+        logPanel = new LinearLayout(this);
+        logPanel.setOrientation(LinearLayout.VERTICAL);
+        logPanel.setVisibility(View.GONE);
+        logPanel.setBackgroundColor(Color.rgb(24, 24, 24));
+        logPanel.setPadding(dp(8), dp(8), dp(8), dp(8));
+
+        LinearLayout logActions = new LinearLayout(this);
+        logActions.setOrientation(LinearLayout.HORIZONTAL);
+
+        Button copyLogButton = new Button(this);
+        copyLogButton.setText("COPIAR LOG");
+        copyLogButton.setOnClickListener(v -> copyLog());
+        logActions.addView(copyLogButton, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        Button reconnectButton = new Button(this);
+        reconnectButton.setText("RECONECTAR");
+        reconnectButton.setOnClickListener(v -> {
+            stopReader();
+            closeAccessory();
+            autoConnectPocket();
+        });
+        logActions.addView(reconnectButton, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        logPanel.addView(logActions);
+
+        ScrollView logScroll = new ScrollView(this);
+        logView = new TextView(this);
+        logView.setTextColor(Color.LTGRAY);
+        logView.setTextSize(11f);
+        logView.setTextIsSelectable(true);
+        logScroll.addView(logView);
+
+        logPanel.addView(logScroll, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(220)));
+
+        root.addView(logPanel);
+
+        setContentView(root);
+    }
+
+    private void toggleLog() {
+        logPanel.setVisibility(
+                logPanel.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE);
+    }
+
+    private void copyLog() {
+        ClipboardManager clipboard =
+                (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+
+        String text =
+                "Pocket Control 1.4\n" +
+                "Android " + Build.VERSION.RELEASE +
+                " / " + Build.MANUFACTURER + " " + Build.MODEL + "\n\n" +
+                log;
+
+        clipboard.setPrimaryClip(ClipData.newPlainText("Pocket Control log", text));
+        Toast.makeText(this, "Log copiado.", Toast.LENGTH_SHORT).show();
+    }
+
+    private void appendLog(String text) {
+        final String line = "[PC] " + text + "\n";
+
+        synchronized (log) {
+            log.append(line);
+
+            if (log.length() > 80_000) {
+                log.delete(0, 20_000);
+            }
+        }
+
+        runOnUiThread(() -> {
+            if (logView != null) {
+                logView.setText(log.toString());
+            }
+        });
+    }
+
+    private void setConnectionStatus(String text, boolean ok) {
+        runOnUiThread(() -> {
+            connectionView.setText(text);
+            connectionView.setTextColor(ok ? Color.GREEN : Color.LTGRAY);
+        });
+    }
+
+    private void updateTelemetry() {
+        runOnUiThread(() -> telemetryView.setText(
+                "DUML " + dumlPackets +
+                "  |  VIDEO " + videoPackets +
+                "  |  " + formatBytes(videoBytes)));
+    }
+
+    // -------------------------------------------------------------------------
+    // USB / AOA
+    // -------------------------------------------------------------------------
 
     private void createPermissionIntent() {
         Intent intent = new Intent(ACTION_USB_PERMISSION);
@@ -151,1530 +438,373 @@ public class MainActivity extends Activity {
 
     private void registerPermissionReceiver() {
         IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(usbPermissionReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            registerReceiver(
+                    usbPermissionReceiver,
+                    filter,
+                    Context.RECEIVER_NOT_EXPORTED);
         } else {
             registerReceiver(usbPermissionReceiver, filter);
         }
+
         receiverRegistered = true;
     }
 
-    private void buildUi() {
-        int pad = dp(16);
-
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(pad, pad, pad, pad);
-
-        TextView title = new TextView(this);
-        title.setText("Pocket Control 1.3 LogicLink Video Test");
-        title.setTextSize(24f);
-        title.setGravity(Gravity.CENTER_HORIZONTAL);
-        root.addView(title, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-
-        TextView subtitle = new TextView(this);
-        subtitle.setText("Teste direcionado do canal de vídeo DJI LogicLink 0x574A");
-        subtitle.setTextSize(15f);
-        subtitle.setGravity(Gravity.CENTER_HORIZONTAL);
-        subtitle.setPadding(0, dp(6), 0, dp(14));
-        root.addView(subtitle);
-
-        statusView = new TextView(this);
-        statusView.setTextSize(18f);
-        statusView.setPadding(dp(12), dp(12), dp(12), dp(12));
-        root.addView(statusView, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-
-        LinearLayout row1 = new LinearLayout(this);
-        row1.setOrientation(LinearLayout.HORIZONTAL);
-        row1.setPadding(0, dp(8), 0, dp(4));
-
-        Button refreshButton = new Button(this);
-        refreshButton.setText("Atualizar USB");
-        refreshButton.setOnClickListener(v -> refreshUsb());
-        row1.addView(refreshButton, new LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-
-        Button openButton = new Button(this);
-        openButton.setText("Abrir canal");
-        openButton.setOnClickListener(v -> openFirstAccessory());
-        row1.addView(openButton, new LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-
-        root.addView(row1);
-
-        LinearLayout row2 = new LinearLayout(this);
-        row2.setOrientation(LinearLayout.HORIZONTAL);
-        row2.setPadding(0, dp(4), 0, dp(8));
-
-        Button listenButton = new Button(this);
-        listenButton.setText("Escutar 10 s");
-        listenButton.setOnClickListener(v -> startPassiveListen());
-        row2.addView(listenButton, new LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-
-        Button closeButton = new Button(this);
-        closeButton.setText("Fechar canal");
-        closeButton.setOnClickListener(v -> {
-            stopListening();
-            closeAccessoryChannel();
-        });
-        row2.addView(closeButton, new LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-
-        root.addView(row2);
-
-        Button txTestButton = new Button(this);
-        txTestButton.setText("TESTAR TX — LER MODO DA CÂMERA");
-        txTestButton.setOnClickListener(v -> sendReadOnlyCameraModeQuery());
-        root.addView(txTestButton, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-
-        Button liveViewProbeButton = new Button(this);
-        liveViewProbeButton.setText("TESTAR LIVE VIEW");
-        liveViewProbeButton.setOnClickListener(v -> runLiveViewProbe());
-        root.addView(liveViewProbeButton, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-
-        Button logicLinkVideoButton = new Button(this);
-        logicLinkVideoButton.setText("TENTAR CANAL DE VÍDEO 0x574A");
-        logicLinkVideoButton.setOnClickListener(v -> tryLogicLinkVideoService());
-        root.addView(logicLinkVideoButton, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-
-        LinearLayout modeRow = new LinearLayout(this);
-        modeRow.setOrientation(LinearLayout.HORIZONTAL);
-
-        Button photoModeButton = new Button(this);
-        photoModeButton.setText("MODO FOTO");
-        photoModeButton.setOnClickListener(v -> sendSetCameraMode(0));
-        modeRow.addView(photoModeButton, new LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-
-        Button videoModeButton = new Button(this);
-        videoModeButton.setText("MODO VÍDEO");
-        videoModeButton.setOnClickListener(v -> sendSetCameraMode(1));
-        modeRow.addView(videoModeButton, new LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-
-        root.addView(modeRow);
-
-        Button copyButton = new Button(this);
-        copyButton.setText("Copiar diagnóstico");
-        copyButton.setOnClickListener(v -> copyDiagnostic());
-        root.addView(copyButton, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-
-        ScrollView scroll = new ScrollView(this);
-        logView = new TextView(this);
-        logView.setTextSize(13f);
-        logView.setTextIsSelectable(true);
-        logView.setPadding(dp(4), dp(10), dp(4), dp(16));
-        scroll.addView(logView);
-
-        root.addView(scroll, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
-
-        setContentView(root);
-    }
-
-    private void refreshUsb() {
-        try {
-            if (usbManager == null) {
-                statusView.setText("❌ Serviço USB indisponível neste aparelho.");
-                baseDiagnostic = "O Android não forneceu UsbManager.";
-                renderLog();
-                return;
-            }
-
-            StringBuilder out = new StringBuilder();
-            out.append("Pocket Control 1.3 LogicLink Video Test\n");
-            out.append("Android: ").append(Build.VERSION.RELEASE)
-                    .append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
-            out.append("Aparelho: ").append(Build.MANUFACTURER)
-                    .append(" ").append(Build.MODEL).append("\n");
-            out.append("ABIs: ");
-            if (Build.SUPPORTED_ABIS != null && Build.SUPPORTED_ABIS.length > 0) {
-                for (int i = 0; i < Build.SUPPORTED_ABIS.length; i++) {
-                    if (i > 0) out.append(", ");
-                    out.append(Build.SUPPORTED_ABIS[i]);
-                }
-            } else {
-                out.append("desconhecidas");
-            }
-            out.append("\n\n");
-
-            boolean found = false;
-            boolean djiLikely = false;
-
-            UsbAccessory[] accessories = null;
-            try {
-                accessories = usbManager.getAccessoryList();
-            } catch (Throwable t) {
-                out.append("Falha ao enumerar USB Accessory: ")
-                        .append(t.getClass().getSimpleName()).append("\n");
-            }
-
-            if (accessories != null && accessories.length > 0) {
-                found = true;
-                out.append("=== USB ACCESSORY ===\n");
-                for (int i = 0; i < accessories.length; i++) {
-                    UsbAccessory a = accessories[i];
-                    String manufacturer = safe(a.getManufacturer());
-                    String model = safe(a.getModel());
-                    if (containsDji(manufacturer) || "HG210".equalsIgnoreCase(model)) {
-                        djiLikely = true;
-                    }
-                    out.append("Acessório #").append(i + 1).append("\n")
-                            .append("Fabricante: ").append(manufacturer).append("\n")
-                            .append("Modelo: ").append(model).append("\n")
-                            .append("Descrição: ").append(safe(a.getDescription())).append("\n")
-                            .append("Versão: ").append(safe(a.getVersion())).append("\n")
-                            .append("Permissão: ").append(usbManager.hasPermission(a) ? "SIM" : "NÃO")
-                            .append("\n")
-                            .append("Canal aberto: ").append(accessoryDescriptor != null ? "SIM" : "NÃO")
-                            .append("\n\n");
-                }
-            }
-
-            HashMap<String, UsbDevice> devices = null;
-            try {
-                devices = usbManager.getDeviceList();
-            } catch (Throwable t) {
-                out.append("Falha ao enumerar USB Host: ")
-                        .append(t.getClass().getSimpleName()).append("\n");
-            }
-
-            if (devices != null && !devices.isEmpty()) {
-                found = true;
-                out.append("=== USB DEVICES ===\n");
-                int index = 0;
-
-                for (UsbDevice d : devices.values()) {
-                    index++;
-                    String manufacturer = safe(callManufacturer(d));
-                    String product = safe(callProduct(d));
-                    if (containsDji(manufacturer) || containsDji(product)) {
-                        djiLikely = true;
-                    }
-
-                    out.append("Dispositivo #").append(index).append("\n")
-                            .append("Nome: ").append(safe(d.getDeviceName())).append("\n")
-                            .append("Fabricante: ").append(manufacturer).append("\n")
-                            .append("Produto: ").append(product).append("\n")
-                            .append("VID: ").append(d.getVendorId())
-                            .append(" (0x").append(hex4(d.getVendorId())).append(")\n")
-                            .append("PID: ").append(d.getProductId())
-                            .append(" (0x").append(hex4(d.getProductId())).append(")\n")
-                            .append("Classe: ").append(d.getDeviceClass()).append("\n")
-                            .append("Subclasse: ").append(d.getDeviceSubclass()).append("\n")
-                            .append("Protocolo: ").append(d.getDeviceProtocol()).append("\n")
-                            .append("Permissão: ").append(usbManager.hasPermission(d) ? "SIM" : "NÃO")
-                            .append("\n")
-                            .append(describeDeviceStructure(d))
-                            .append("\n");
-                }
-            }
-
-            Intent launchIntent = getIntent();
-            if (launchIntent != null && launchIntent.getAction() != null) {
-                out.append("Intent atual: ").append(launchIntent.getAction()).append("\n\n");
-            }
-
-            if (!found) {
-                statusView.setText("⚪ Nenhum dispositivo USB detectado");
-                out.append("Nenhum USB Device/Accessory foi encontrado.\n")
-                        .append("Conecte a Osmo Pocket 1, ligue-a e toque em Atualizar USB.\n");
-            } else if (djiLikely && accessoryDescriptor != null) {
-                statusView.setText("🟢 Osmo detectada — canal aberto");
-            } else if (djiLikely) {
-                statusView.setText("✅ Osmo Pocket detectada");
-            } else {
-                statusView.setText("🟡 USB detectado — precisamos identificar");
-            }
-
-            baseDiagnostic = out.toString();
-            renderLog();
-        } catch (Throwable t) {
-            statusView.setText("⚠️ Erro capturado — o app continuou aberto");
-            baseDiagnostic = "Erro em refreshUsb():\n"
-                    + t.getClass().getName() + ": " + safe(t.getMessage());
-            renderLog();
-        }
-    }
-
     private void autoConnectPocket() {
-        if (accessoryDescriptor != null) {
-            if (!liveViewProbeDone && !listening) {
-                mainHandler.postDelayed(this::runLiveViewProbe, 450);
+        if (accessoryDescriptor != null) return;
+
+        UsbAccessory[] list = usbManager.getAccessoryList();
+
+        if (list == null || list.length == 0) {
+            setConnectionStatus("DESCONECTADA", false);
+            cameraStateView.setText("Conecte e ligue a Osmo Pocket.");
+            return;
+        }
+
+        UsbAccessory target = null;
+
+        for (UsbAccessory a : list) {
+            if ("DJI".equalsIgnoreCase(safe(a.getManufacturer()))
+                    && "HG210".equalsIgnoreCase(safe(a.getModel()))) {
+                target = a;
+                break;
             }
+        }
+
+        if (target == null) {
+            setConnectionStatus("USB desconhecido", false);
             return;
         }
 
-        UsbAccessory[] accessories = usbManager.getAccessoryList();
-        if (accessories == null || accessories.length == 0) {
-            statusView.setText("⚪ Conecte a Osmo Pocket");
-            return;
-        }
-
-        UsbAccessory target = accessories[0];
-
-        if (!"DJI".equalsIgnoreCase(safe(target.getManufacturer()))
-                || !"HG210".equalsIgnoreCase(safe(target.getModel()))) {
-            statusView.setText("🟡 Acessório USB encontrado, aguardando Osmo Pocket");
-            return;
-        }
+        appendLog("HG210 encontrada: " +
+                safe(target.getManufacturer()) + " / " +
+                safe(target.getModel()));
 
         if (usbManager.hasPermission(target)) {
-            appendEvent("Conexão automática: DJI HG210 encontrada.");
-            openAccessoryChannel(target);
-        } else if (!autoConnectAttempted) {
-            autoConnectAttempted = true;
-            appendEvent("Conexão automática: solicitando permissão USB.");
+            openAccessory(target);
+        } else {
+            appendLog("Solicitando permissão USB...");
             usbManager.requestPermission(target, permissionIntent);
         }
     }
 
-    private void openFirstAccessory() {
-        try {
-            UsbAccessory[] accessories = usbManager.getAccessoryList();
-            if (accessories == null || accessories.length == 0) {
-                appendEvent("Nenhum USB Accessory conectado.");
-                Toast.makeText(this, "Nenhuma Osmo detectada.", Toast.LENGTH_SHORT).show();
-                return;
-            }
-
-            UsbAccessory accessory = accessories[0];
-            if (!usbManager.hasPermission(accessory)) {
-                appendEvent("Solicitando permissão para o acessório...");
-                usbManager.requestPermission(accessory, permissionIntent);
-                return;
-            }
-
-            openAccessoryChannel(accessory);
-        } catch (Throwable t) {
-            appendEvent("Falha ao abrir acessório: " + t.getClass().getSimpleName()
-                    + " - " + safe(t.getMessage()));
-        }
-    }
-
-    private synchronized void openAccessoryChannel(UsbAccessory accessory) {
-        if (accessoryDescriptor != null) {
-            appendEvent("O canal já está aberto.");
-            return;
-        }
+    private synchronized void openAccessory(UsbAccessory accessory) {
+        if (accessoryDescriptor != null) return;
 
         try {
             accessoryDescriptor = usbManager.openAccessory(accessory);
+
             if (accessoryDescriptor == null) {
-                appendEvent("Android retornou null ao abrir USB Accessory.");
-                statusView.setText("❌ Não foi possível abrir o canal");
+                appendLog("openAccessory() retornou null.");
+                setConnectionStatus("FALHA USB", false);
                 return;
             }
 
-            accessoryInput = new FileInputStream(accessoryDescriptor.getFileDescriptor());
-            accessoryOutput = new FileOutputStream(accessoryDescriptor.getFileDescriptor());
+            accessoryInput =
+                    new FileInputStream(accessoryDescriptor.getFileDescriptor());
+            accessoryOutput =
+                    new FileOutputStream(accessoryDescriptor.getFileDescriptor());
 
-            appendEvent("Canal USB Accessory aberto. fd=" + accessoryDescriptor.getFd());
-            appendEvent("1.3: conexão automática ativa. O teste de vídeo 0x574A só roda ao tocar no botão.");
-            statusView.setText("🟢 Osmo detectada — canal aberto");
-            refreshUsb();
+            setConnectionStatus("HG210 CONECTADA", true);
+            cameraStateView.setText("Osmo conectada. Lendo estado...");
+            appendLog("Canal AOA aberto. fd=" + accessoryDescriptor.getFd());
+
+            startReader();
+
         } catch (Throwable t) {
-            appendEvent("Erro ao abrir canal: " + t.getClass().getSimpleName()
-                    + " - " + safe(t.getMessage()));
-            closeAccessoryChannel();
+            appendLog("Erro abrindo AOA: " +
+                    t.getClass().getSimpleName() + " - " + safe(t.getMessage()));
+            closeAccessory();
         }
     }
 
-
-    /**
-     * Primeiro teste de transmissão do projeto.
-     *
-     * Envia somente CAMERA / Camera Work Mode Get (cmd set 0x02, cmd 0x11).
-     * Este comando é de consulta e não altera configuração, gravação ou gimbal.
-     */
-    /**
-     * Troca somente o modo de trabalho da câmera:
-     * 0 = TAKEPHOTO, 1 = RECORD.
-     * Não inicia captura nem gravação.
-     */
-    private synchronized void sendSetCameraMode(final int mode) {
-        if (mode != 0 && mode != 1) {
-            appendEvent("Modo recusado pelo app: " + mode);
-            return;
-        }
-
-        if (listening) {
-            Toast.makeText(this,
-                    "Espere o teste/escuta atual terminar.",
-                    Toast.LENGTH_LONG).show();
-            return;
-        }
-
-        if (accessoryDescriptor == null || accessoryOutput == null || accessoryInput == null) {
-            openFirstAccessory();
-            if (accessoryDescriptor == null || accessoryOutput == null || accessoryInput == null) {
-                appendEvent("Mudança de modo cancelada: canal USB indisponível.");
-                return;
-            }
-        }
-
-        final int seq = nextTxSequence & 0xFFFF;
-        nextTxSequence = (nextTxSequence + 1) & 0xFFFF;
-        if (nextTxSequence == 0) nextTxSequence = 1;
+    private synchronized void closeAccessory() {
+        stopReader();
 
         try {
-            byte[] payload = new byte[]{(byte) (mode & 0xFF)};
-
-            // Sender App (2) -> Camera (1)
-            // cmd set Camera 0x02 / Camera Work Mode Set 0x10
-            byte[] duml = buildDumlPacket(
-                    0x02, 0x01, seq,
-                    0, 2, 0,
-                    0x02, 0x10,
-                    payload);
-
-            byte[] transport = wrapPocketTransport(duml);
-            accessoryOutput.write(transport);
-            accessoryOutput.flush();
-
-            appendEvent("TX: Camera Work Mode Set → "
-                    + cameraModeName(mode)
-                    + " (0x02/0x10), seq=" + seq);
-            appendEvent("DUML TX: " + toHex(duml));
-            statusView.setText("📤 Alterando para " + cameraModeName(mode) + "...");
-
-            listenForSetModeResponse(seq, mode, 2600L);
-
-        } catch (Throwable t) {
-            appendEvent("Falha ao trocar modo: " + t.getClass().getSimpleName()
-                    + " - " + safe(t.getMessage()));
-            statusView.setText("❌ Falha ao trocar modo");
+            if (accessoryInput != null) accessoryInput.close();
+        } catch (Throwable ignored) {
         }
-    }
-
-    private void listenForSetModeResponse(
-            final int expectedSeq,
-            final int requestedMode,
-            final long timeoutMs) {
-
-        if (listening) return;
-        listening = true;
-
-        listenThread = new Thread(() -> {
-            ByteArrayOutputStream rx = new ByteArrayOutputStream();
-            long deadline = System.currentTimeMillis() + timeoutMs;
-            byte[] buffer = new byte[4096];
-
-            try {
-                StructPollfd pollfd = new StructPollfd();
-                pollfd.fd = accessoryDescriptor.getFileDescriptor();
-                pollfd.events = (short) OsConstants.POLLIN;
-                StructPollfd[] pollfds = new StructPollfd[]{pollfd};
-
-                while (listening && System.currentTimeMillis() < deadline) {
-                    pollfd.revents = 0;
-                    int ready = Os.poll(pollfds, 120);
-
-                    if (!listening) break;
-
-                    if (ready > 0 && (pollfd.revents & OsConstants.POLLIN) != 0) {
-                        int count = accessoryInput.read(buffer);
-                        if (count < 0) break;
-                        if (count > 0) {
-                            rx.write(buffer, 0, count);
-                            if (rx.size() >= 49152) break;
-                        }
-                    }
-                }
-            } catch (Throwable t) {
-                appendEventFromWorker("Erro aguardando ACK de modo: "
-                        + t.getClass().getSimpleName() + " - " + safe(t.getMessage()));
-            } finally {
-                listening = false;
-
-                final byte[] received = rx.toByteArray();
-                final String ack = findGenericResponse(
-                        received, expectedSeq, 0x02, 0x10);
-
-                // Também procuramos o push 0x80 para ver o modo realmente anunciado.
-                final int pushedMode = findLastCameraStateMode(received);
-
-                runOnUiThread(() -> {
-                    appendEvent("RESULTADO DA TROCA DE MODO\\n"
-                            + "Solicitado: " + cameraModeName(requestedMode)
-                            + " (" + requestedMode + ")\\n"
-                            + ack
-                            + "\\nModo visto no push 0x80: "
-                            + (pushedMode >= 0
-                                ? cameraModeName(pushedMode) + " (" + pushedMode + ")"
-                                : "não encontrado neste intervalo"));
-
-                    if (pushedMode == requestedMode) {
-                        statusView.setText("✅ Modo " + cameraModeName(requestedMode) + " confirmado");
-                    } else {
-                        statusView.setText("🟡 Comando enviado — confira o diagnóstico");
-                    }
-                });
-            }
-        }, "PocketSetModeResponse");
-
-        listenThread.start();
-    }
-
-    private String findGenericResponse(
-            byte[] data, int expectedSeq, int expectedCmdSet, int expectedCmdId) {
-
-        if (data == null || data.length == 0) {
-            return "ACK: nenhum byte recebido.";
-        }
-
-        int responseCount = 0;
-        StringBuilder matches = new StringBuilder();
-
-        int pos = 0;
-        while (pos + 8 <= data.length) {
-            if (!looksLikePocketTransportHeader(data, pos)) {
-                pos++;
-                continue;
-            }
-
-            long outerLenLong = readLe32(data, pos + 4);
-            if (outerLenLong < 0 || outerLenLong > Integer.MAX_VALUE) {
-                pos++;
-                continue;
-            }
-
-            int outerLen = (int) outerLenLong;
-            int payloadStart = pos + 8;
-            int payloadEnd = Math.min(data.length, payloadStart + outerLen);
-
-            int p = payloadStart;
-            while (p + 13 <= payloadEnd) {
-                if ((data[p] & 0xFF) != 0x55) {
-                    p++;
-                    continue;
-                }
-
-                int frameLength =
-                        (data[p + 1] & 0xFF) | ((data[p + 2] & 0x03) << 8);
-                if (frameLength < 13 || p + frameLength > payloadEnd) {
-                    p++;
-                    continue;
-                }
-
-                int seq = (data[p + 6] & 0xFF) | ((data[p + 7] & 0xFF) << 8);
-                int cmdType = data[p + 8] & 0xFF;
-                int packetType = (cmdType >> 7) & 0x01;
-                int cmdSet = data[p + 9] & 0xFF;
-                int cmdId = data[p + 10] & 0xFF;
-                int innerLen = frameLength - 13;
-                int innerStart = p + 11;
-
-                if (packetType == 1
-                        && seq == expectedSeq
-                        && cmdSet == expectedCmdSet
-                        && cmdId == expectedCmdId) {
-
-                    responseCount++;
-                    byte[] payload = new byte[Math.max(0, innerLen)];
-                    if (innerLen > 0) {
-                        System.arraycopy(data, innerStart, payload, 0, innerLen);
-                    }
-
-                    matches.append("ACK #").append(responseCount)
-                            .append(": payload ")
-                            .append(payload.length == 0 ? "(vazio)" : toHex(payload));
-
-                    if (payload.length > 0) {
-                        matches.append(" | status provável=")
-                                .append(payload[0] & 0xFF);
-                    }
-                    matches.append("\\n");
-                }
-
-                p += frameLength;
-            }
-
-            if (payloadStart + outerLen <= data.length) {
-                pos = payloadStart + outerLen;
-            } else {
-                break;
-            }
-        }
-
-        if (responseCount == 0) {
-            return "ACK: não localizado para seq=" + expectedSeq
-                    + ", cmd 0x" + hex2(expectedCmdSet)
-                    + "/0x" + hex2(expectedCmdId) + ".";
-        }
-
-        return "ACK correspondente encontrado: " + responseCount + "\\n" + matches;
-    }
-
-    private int findLastCameraStateMode(byte[] data) {
-        if (data == null || data.length == 0) return -1;
-
-        int lastMode = -1;
-        int pos = 0;
-
-        while (pos + 8 <= data.length) {
-            if (!looksLikePocketTransportHeader(data, pos)) {
-                pos++;
-                continue;
-            }
-
-            long outerLenLong = readLe32(data, pos + 4);
-            if (outerLenLong < 0 || outerLenLong > Integer.MAX_VALUE) {
-                pos++;
-                continue;
-            }
-
-            int outerLen = (int) outerLenLong;
-            int payloadStart = pos + 8;
-            int payloadEnd = Math.min(data.length, payloadStart + outerLen);
-
-            int p = payloadStart;
-            while (p + 13 <= payloadEnd) {
-                if ((data[p] & 0xFF) != 0x55) {
-                    p++;
-                    continue;
-                }
-
-                int frameLength =
-                        (data[p + 1] & 0xFF) | ((data[p + 2] & 0x03) << 8);
-                if (frameLength < 13 || p + frameLength > payloadEnd) {
-                    p++;
-                    continue;
-                }
-
-                int cmdSet = data[p + 9] & 0xFF;
-                int cmdId = data[p + 10] & 0xFF;
-                int innerLen = frameLength - 13;
-                int innerStart = p + 11;
-
-                if (cmdSet == 0x02 && cmdId == 0x80 && innerLen >= 5) {
-                    lastMode = data[innerStart + 4] & 0xFF;
-                }
-
-                p += frameLength;
-            }
-
-            if (payloadStart + outerLen <= data.length) {
-                pos = payloadStart + outerLen;
-            } else {
-                break;
-            }
-        }
-
-        return lastMode;
-    }
-
-    /**
-     * Probe de Live View somente com comandos GET:
-     * 0x02/0x06 = Get USB Switch
-     * 0x02/0x8C = Racing Liveview Format Get
-     *
-     * Nenhum dos dois altera configuração da câmera.
-     */
-    private synchronized void runLiveViewProbe() {
-        if (liveViewProbeDone || listening) {
-            return;
-        }
-
-        if (accessoryDescriptor == null || accessoryOutput == null || accessoryInput == null) {
-            autoConnectPocket();
-            return;
-        }
-
-        final int seqUsb = nextTxSequence & 0xFFFF;
-        nextTxSequence = (nextTxSequence + 1) & 0xFFFF;
-        if (nextTxSequence == 0) nextTxSequence = 1;
-
-        final int seqFormat = nextTxSequence & 0xFFFF;
-        nextTxSequence = (nextTxSequence + 1) & 0xFFFF;
-        if (nextTxSequence == 0) nextTxSequence = 1;
 
         try {
-            byte[] getUsb = buildDumlPacket(
-                    0x02, 0x01, seqUsb,
-                    0, 2, 0,
-                    0x02, 0x06,
-                    new byte[0]);
-
-            byte[] getLiveFormat = buildDumlPacket(
-                    0x02, 0x01, seqFormat,
-                    0, 2, 0,
-                    0x02, 0x8C,
-                    new byte[0]);
-
-            accessoryOutput.write(wrapPocketTransport(getUsb));
-            accessoryOutput.flush();
-
-            try { Thread.sleep(60); } catch (InterruptedException ignored) {}
-
-            accessoryOutput.write(wrapPocketTransport(getLiveFormat));
-            accessoryOutput.flush();
-
-            appendEvent("LIVE VIEW PROBE: consultas 0x02/0x06 e 0x02/0x8C enviadas.");
-            statusView.setText("🔎 Detectando canal de Live View...");
-
-            listenForLiveViewProbe(seqUsb, seqFormat, 3200L);
-
-        } catch (Throwable t) {
-            appendEvent("Falha no Live View Probe: "
-                    + t.getClass().getSimpleName() + " - " + safe(t.getMessage()));
-            statusView.setText("❌ Falha no teste de Live View");
+            if (accessoryOutput != null) accessoryOutput.close();
+        } catch (Throwable ignored) {
         }
+
+        try {
+            if (accessoryDescriptor != null) accessoryDescriptor.close();
+        } catch (Throwable ignored) {
+        }
+
+        accessoryInput = null;
+        accessoryOutput = null;
+        accessoryDescriptor = null;
+
+        logicLinkPending = new byte[0];
+
+        setConnectionStatus("DESCONECTADA", false);
     }
 
-    private void listenForLiveViewProbe(
-            final int seqUsb,
-            final int seqFormat,
-            final long timeoutMs) {
+    // -------------------------------------------------------------------------
+    // Leitor contínuo LogicLink
+    // -------------------------------------------------------------------------
 
-        if (listening) return;
-        listening = true;
+    private synchronized void startReader() {
+        if (readerRunning) return;
+        if (accessoryInput == null) return;
 
-        listenThread = new Thread(() -> {
-            ByteArrayOutputStream rx = new ByteArrayOutputStream();
-            long deadline = System.currentTimeMillis() + timeoutMs;
-            byte[] buffer = new byte[8192];
+        readerRunning = true;
+
+        readerThread = new Thread(() -> {
+            byte[] buffer = new byte[16 * 1024];
 
             try {
-                StructPollfd pollfd = new StructPollfd();
-                pollfd.fd = accessoryDescriptor.getFileDescriptor();
-                pollfd.events = (short) OsConstants.POLLIN;
-                StructPollfd[] pollfds = new StructPollfd[]{pollfd};
+                while (readerRunning && accessoryInput != null) {
+                    int count = accessoryInput.read(buffer);
 
-                while (listening && System.currentTimeMillis() < deadline) {
-                    pollfd.revents = 0;
-                    int ready = Os.poll(pollfds, 120);
+                    if (count < 0) break;
+                    if (count == 0) continue;
 
-                    if (!listening) break;
-
-                    if (ready > 0 && (pollfd.revents & OsConstants.POLLIN) != 0) {
-                        int count = accessoryInput.read(buffer);
-                        if (count < 0) break;
-
-                        if (count > 0) {
-                            rx.write(buffer, 0, count);
-                            if (rx.size() >= 131072) break;
-                        }
-                    }
+                    feedLogicLink(buffer, count);
                 }
+
             } catch (Throwable t) {
-                appendEventFromWorker("Erro no Live View Probe: "
-                        + t.getClass().getSimpleName() + " - " + safe(t.getMessage()));
+                if (readerRunning) {
+                    appendLog("Leitor USB terminou: " +
+                            t.getClass().getSimpleName() + " - " +
+                            safe(t.getMessage()));
+                }
             } finally {
-                listening = false;
-                liveViewProbeDone = true;
-
-                final byte[] received = rx.toByteArray();
-                final String usbRsp = findGenericResponse(received, seqUsb, 0x02, 0x06);
-                final String formatRsp = findGenericResponse(received, seqFormat, 0x02, 0x8C);
-                final String h264 = analyzeH264Markers(received);
-
-                runOnUiThread(() -> {
-                    appendEvent("=== LIVE VIEW PROBE ===\\n"
-                            + "GET USB SWITCH:\\n" + usbRsp + "\\n\\n"
-                            + "GET LIVEVIEW FORMAT:\\n" + formatRsp + "\\n\\n"
-                            + "BUSCA H.264:\\n" + h264);
-
-                    statusView.setText("🟢 Osmo conectada — Live View em preparação");
-                });
+                readerRunning = false;
             }
-        }, "PocketLiveViewProbe");
 
-        listenThread.start();
+        }, "PocketControl-LogicLinkReader");
+
+        readerThread.start();
+        appendLog("Leitor LogicLink contínuo iniciado.");
     }
 
-    private String analyzeH264Markers(byte[] data) {
-        if (data == null || data.length < 8) {
-            return "Sem dados suficientes.";
-        }
+    private void stopReader() {
+        readerRunning = false;
+    }
 
-        int outerBlocks = 0;
-        long totalOuterPayload = 0;
-        long controlBytes = 0;
-        long rawBytes = 0;
-        int maxOuterPayload = 0;
-        int rawSegments = 0;
-        int maxRawSegment = 0;
+    private void feedLogicLink(byte[] incoming, int length) {
+        byte[] merged =
+                new byte[logicLinkPending.length + length];
 
-        ByteArrayOutputStream raw = new ByteArrayOutputStream();
+        System.arraycopy(
+                logicLinkPending, 0,
+                merged, 0,
+                logicLinkPending.length);
 
-        int pos = 0;
-        int rawRunStart = -1;
+        System.arraycopy(
+                incoming, 0,
+                merged, logicLinkPending.length,
+                length);
 
-        while (pos < data.length) {
-            boolean validOuter = false;
+        int p = 0;
 
-            if (pos + 8 <= data.length && looksLikePocketTransportHeader(data, pos)) {
-                long lenLong = readLe32(data, pos + 4);
+        while (merged.length - p >= 8) {
 
-                if (lenLong >= 0 && lenLong <= Integer.MAX_VALUE) {
-                    int len = (int) lenLong;
-                    int payloadStart = pos + 8;
-                    int payloadEnd = payloadStart + len;
-
-                    if (len >= 0 && payloadEnd <= data.length) {
-                        // Flush bytes that came before this valid 55 CC 49 57 block.
-                        if (rawRunStart >= 0 && rawRunStart < pos) {
-                            int n = pos - rawRunStart;
-                            raw.write(data, rawRunStart, n);
-                            rawBytes += n;
-                            rawSegments++;
-                            if (n > maxRawSegment) maxRawSegment = n;
-                            rawRunStart = -1;
-                        }
-
-                        validOuter = true;
-                        outerBlocks++;
-                        totalOuterPayload += len;
-                        if (len > maxOuterPayload) maxOuterPayload = len;
-
-                        int parsed = countContiguousDumlBytes(data, payloadStart, payloadEnd);
-                        controlBytes += parsed;
-
-                        // Anything inside the DJI outer block after the DUML sequence
-                        // is also raw/unclassified data.
-                        if (parsed < len) {
-                            int rawStart = payloadStart + parsed;
-                            int rawLen = payloadEnd - rawStart;
-
-                            if (rawLen > 0) {
-                                raw.write(data, rawStart, rawLen);
-                                rawBytes += rawLen;
-                                rawSegments++;
-                                if (rawLen > maxRawSegment) maxRawSegment = rawLen;
-                            }
-                        }
-
-                        pos = payloadEnd;
-                    }
-                }
+            // resync
+            if ((merged[p] & 0xFF) != 0x55
+                    || (merged[p + 1] & 0xFF) != 0xCC) {
+                p++;
+                continue;
             }
 
-            if (!validOuter) {
-                if (rawRunStart < 0) rawRunStart = pos;
-                pos++;
+            int port = readLe16(merged, p + 2);
+
+            long payloadLenLong =
+                    ((long) merged[p + 4] & 0xFFL)
+                    | (((long) merged[p + 5] & 0xFFL) << 8)
+                    | (((long) merged[p + 6] & 0xFFL) << 16)
+                    | (((long) merged[p + 7] & 0xFFL) << 24);
+
+            if (payloadLenLong < 0 || payloadLenLong > 8 * 1024 * 1024) {
+                p++;
+                continue;
             }
+
+            int payloadLen = (int) payloadLenLong;
+            int packetLen = 8 + payloadLen;
+
+            if (merged.length - p < packetLen) {
+                break;
+            }
+
+            byte[] payload =
+                    Arrays.copyOfRange(
+                            merged,
+                            p + 8,
+                            p + packetLen);
+
+            routeLogicLinkPacket(port, payload);
+
+            p += packetLen;
         }
 
-        // Flush any trailing bytes after the last known transport block.
-        if (rawRunStart >= 0 && rawRunStart < data.length) {
-            int n = data.length - rawRunStart;
-            raw.write(data, rawRunStart, n);
-            rawBytes += n;
-            rawSegments++;
-            if (n > maxRawSegment) maxRawSegment = n;
+        logicLinkPending =
+                p < merged.length
+                        ? Arrays.copyOfRange(merged, p, merged.length)
+                        : new byte[0];
+
+        // Evita crescimento infinito se perdermos sincronismo.
+        if (logicLinkPending.length > 2 * 1024 * 1024) {
+            appendLog("Resync LogicLink: buffer residual muito grande.");
+            logicLinkPending = new byte[0];
         }
+    }
 
-        byte[] rawData = raw.toByteArray();
-        NalStats annexB = scanAnnexBNals(rawData);
-        NalStats avcc = scanAvccNals(rawData);
+    private void routeLogicLinkPacket(int port, byte[] payload) {
+        if (port == PORT_DUML) {
+            dumlPackets++;
+            parseDuml(payload);
 
-        int jpegStarts = countPattern(rawData, new byte[]{(byte)0xFF, (byte)0xD8, (byte)0xFF});
-        int mpegTsSyncs = countMpegTsLikeSync(rawData);
+            if ((dumlPackets % 25) == 0) {
+                updateTelemetry();
+            }
 
-        StringBuilder out = new StringBuilder();
-        out.append("Bytes totais capturados: ").append(data.length).append("\\n");
-        out.append("Blocos 55 CC 49 57 válidos: ").append(outerBlocks).append("\\n");
-        out.append("Payload total desses blocos: ").append(totalOuterPayload).append(" bytes\\n");
-        out.append("Bytes DUML reconhecidos: ").append(controlBytes).append("\\n");
-        out.append("Bytes RAW/não classificados: ").append(rawBytes).append("\\n");
-        out.append("Segmentos RAW: ").append(rawSegments)
-                .append(" | maior segmento RAW: ").append(maxRawSegment).append(" bytes\\n");
-        out.append("Maior payload 55 CC: ").append(maxOuterPayload).append(" bytes\\n\\n");
+        } else if (port == PORT_VIDEO) {
+            videoPackets++;
+            videoBytes += payload.length;
 
-        out.append("=== H.264 ANNEX-B NOS BYTES RAW ===\\n");
-        out.append(formatNalStats(annexB)).append("\\n\\n");
+            if (videoPackets == 1) {
+                appendLog("*** PORTA 0x574A APARECEU — VÍDEO RECEBIDO ***");
+                runOnUiThread(() ->
+                        videoStateView.setText("LIVE VIEW: recebendo 0x574A"));
+            }
 
-        out.append("=== H.264 AVCC/LENGTH-PREFIXED NOS BYTES RAW ===\\n");
-        out.append(formatNalStats(avcc)).append("\\n\\n");
+            h264Collector.push(payload);
 
-        out.append("JPEG SOI encontrados: ").append(jpegStarts).append("\\n");
-        out.append("Possíveis sync bytes MPEG-TS: ").append(mpegTsSyncs).append("\\n\\n");
+            if ((videoPackets % 10) == 0) {
+                updateTelemetry();
+            }
 
-        boolean strongAnnexB = annexB.sps > 0 && annexB.pps > 0 && annexB.idr > 0;
-        boolean strongAvcc = avcc.sps > 0 && avcc.pps > 0 && avcc.idr > 0;
-
-        if (strongAnnexB || strongAvcc) {
-            out.append("RESULTADO: forte evidência de fluxo H.264 decodificável no mesmo descritor USB.\\n");
-        } else if (rawBytes > 0) {
-            out.append("RESULTADO: existem bytes fora do canal DUML, mas ainda não formam um H.264 completo ")
-                    .append("(SPS+PPS+IDR). Precisamos identificar o framing desses segmentos.\\n");
         } else {
-            out.append("RESULTADO: neste intervalo, TODO byte recebido pertenceu a blocos DJI/DUML. ")
-                    .append("O Live View provavelmente usa outra sessão/canal ou só começa após uma sequência de inicialização específica.\\n");
+            appendLog(String.format(
+                    Locale.US,
+                    "LogicLink port desconhecida 0x%04X (%d bytes)",
+                    port,
+                    payload.length));
         }
-
-        if (rawData.length > 0) {
-            int preview = Math.min(rawData.length, 160);
-            byte[] p = new byte[preview];
-            System.arraycopy(rawData, 0, p, 0, preview);
-            out.append("\\nPrimeiros ").append(preview)
-                    .append(" bytes RAW:\\n").append(toHex(p)).append("\\n");
-        }
-
-        out.append("\\nCorreção da 1.2: agora bytes ANTES, ENTRE e DEPOIS dos blocos 55 CC também entram na análise.");
-
-        return out.toString();
     }
 
-    private String formatNalStats(NalStats s) {
-        return "Start/frames=" + s.startCodes
-                + " | SPS=" + s.sps
-                + " | PPS=" + s.pps
-                + " | IDR=" + s.idr
-                + " | non-IDR=" + s.nonIdr
-                + " | SEI=" + s.sei
-                + " | outros=" + s.other;
-    }
+    // -------------------------------------------------------------------------
+    // DUML — leitura de estado + comandos já validados
+    // -------------------------------------------------------------------------
 
-    private NalStats scanAvccNals(byte[] data) {
-        NalStats s = new NalStats();
-        if (data == null || data.length < 5) return s;
+    private void parseDuml(byte[] data) {
+        int p = 0;
 
-        int i = 0;
-        while (i + 5 <= data.length) {
-            int len = ((data[i] & 0xFF) << 24)
-                    | ((data[i + 1] & 0xFF) << 16)
-                    | ((data[i + 2] & 0xFF) << 8)
-                    | (data[i + 3] & 0xFF);
-
-            if (len > 0 && len <= data.length - (i + 4)) {
-                int type = data[i + 4] & 0x1F;
-
-                // Restrict to plausible H.264 NAL types to avoid random binary false positives.
-                if (type == 1 || type == 5 || type == 6 || type == 7 || type == 8) {
-                    s.startCodes++;
-
-                    switch (type) {
-                        case 1: s.nonIdr++; break;
-                        case 5: s.idr++; break;
-                        case 6: s.sei++; break;
-                        case 7: s.sps++; break;
-                        case 8: s.pps++; break;
-                        default: s.other++; break;
-                    }
-
-                    i += 4 + len;
-                    continue;
-                }
+        while (p + 13 <= data.length) {
+            if ((data[p] & 0xFF) != 0x55) {
+                p++;
+                continue;
             }
 
-            i++;
-        }
-
-        return s;
-    }
-
-    private int countPattern(byte[] data, byte[] pattern) {
-        if (data == null || pattern == null || pattern.length == 0) return 0;
-        int count = 0;
-
-        for (int i = 0; i + pattern.length <= data.length; i++) {
-            boolean same = true;
-            for (int j = 0; j < pattern.length; j++) {
-                if (data[i + j] != pattern[j]) {
-                    same = false;
-                    break;
-                }
-            }
-            if (same) count++;
-        }
-
-        return count;
-    }
-
-    private int countMpegTsLikeSync(byte[] data) {
-        if (data == null || data.length < 188 * 3) return 0;
-
-        int hits = 0;
-        for (int i = 0; i < 188 && i < data.length; i++) {
-            int local = 0;
-            for (int p = i; p < data.length; p += 188) {
-                if ((data[p] & 0xFF) == 0x47) local++;
-            }
-            if (local > hits) hits = local;
-        }
-        return hits;
-    }
-
-    private int countContiguousDumlBytes(byte[] data, int start, int end) {
-        int p = start;
-        int parsed = 0;
-
-        while (p + 13 <= end && (data[p] & 0xFF) == 0x55) {
             int frameLength =
-                    (data[p + 1] & 0xFF) | ((data[p + 2] & 0x03) << 8);
+                    (data[p + 1] & 0xFF)
+                    | ((data[p + 2] & 0x03) << 8);
 
-            if (frameLength < 13 || p + frameLength > end) {
+            if (frameLength < 13 || p + frameLength > data.length) {
                 break;
             }
 
-            parsed += frameLength;
+            int cmdSet = data[p + 9] & 0xFF;
+            int cmdId  = data[p + 10] & 0xFF;
+
+            int innerStart = p + 11;
+            int innerLength = frameLength - 13;
+
+            // Camera State Info
+            if (cmdSet == 0x02
+                    && cmdId == 0x80
+                    && innerLength >= 5) {
+
+                int mode = data[innerStart + 4] & 0xFF;
+
+                if (mode != currentCameraMode) {
+                    currentCameraMode = mode;
+
+                    runOnUiThread(() -> {
+                        String name =
+                                currentCameraMode == 0 ? "FOTO"
+                                : currentCameraMode == 1 ? "VÍDEO"
+                                : "MODO " + currentCameraMode;
+
+                        cameraStateView.setText(
+                                "Câmera: " + name +
+                                "  •  controle bidirecional ativo");
+
+                        updateModeButtons();
+                    });
+                }
+            }
+
             p += frameLength;
         }
-
-        return parsed;
     }
 
-    private static class NalStats {
-        int startCodes;
-        int sps;
-        int pps;
-        int idr;
-        int nonIdr;
-        int sei;
-        int other;
+    private void updateModeButtons() {
+        photoModeButton.setEnabled(currentCameraMode != 0);
+        videoModeButton.setEnabled(currentCameraMode != 1);
     }
 
-    private NalStats scanAnnexBNals(byte[] data) {
-        NalStats s = new NalStats();
-
-        if (data == null || data.length < 5) return s;
-
-        for (int i = 0; i + 4 < data.length; i++) {
-            int nal = -1;
-
-            if (i + 4 < data.length
-                    && data[i] == 0
-                    && data[i + 1] == 0
-                    && data[i + 2] == 0
-                    && data[i + 3] == 1) {
-                nal = i + 4;
-            } else if (data[i] == 0
-                    && data[i + 1] == 0
-                    && data[i + 2] == 1) {
-                nal = i + 3;
-            }
-
-            if (nal >= 0 && nal < data.length) {
-                s.startCodes++;
-                int type = data[nal] & 0x1F;
-
-                switch (type) {
-                    case 1: s.nonIdr++; break;
-                    case 5: s.idr++; break;
-                    case 6: s.sei++; break;
-                    case 7: s.sps++; break;
-                    case 8: s.pps++; break;
-                    default: s.other++; break;
-                }
-
-                i = nal;
-            }
-        }
-
-        return s;
-    }
-
-    /**
-     * EXPERIMENTO 1.3:
-     *
-     * O transporte móvel DJI LogicLink usa:
-     *   0x5749 -> canal DUML/controle
-     *   0x574A -> vídeo bruto em equipamentos DJI conhecidos.
-     *
-     * Os dois pacotes abaixo são uma sequência pública de inicialização de
-     * serviço de vídeo observada em equipamentos DJI LogicLink mais novos.
-     * Não é uma sequência confirmada para HG210; por isso só roda quando o
-     * usuário toca no botão e é enviada apenas uma vez.
-     */
-    private synchronized void tryLogicLinkVideoService() {
-        if (listening) {
+    private synchronized void sendSetCameraMode(int mode) {
+        if (accessoryOutput == null) {
             Toast.makeText(this,
-                    "Espere o teste atual terminar.",
-                    Toast.LENGTH_LONG).show();
+                    "Pocket não conectada.",
+                    Toast.LENGTH_SHORT).show();
             return;
         }
 
-        if (accessoryDescriptor == null || accessoryOutput == null || accessoryInput == null) {
-            autoConnectPocket();
-            if (accessoryDescriptor == null || accessoryOutput == null || accessoryInput == null) {
-                appendEvent("Teste 0x574A cancelado: canal USB indisponível.");
-                return;
-            }
-        }
-
-        final byte[] servicePacket1 = new byte[] {
-                (byte)0x55, (byte)0xCC, (byte)0x49, (byte)0x57,
-                (byte)0x2D, 0x00, 0x00, 0x00,
-                0x55, 0x2D, 0x04, (byte)0xF2, 0x02, 0x28, (byte)0xF3, (byte)0xFE,
-                0x40, 0x00, (byte)0x99,
-                0x02, 0x02, 0x00, 0x00, (byte)0xD5, 0x07, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x13, 0x00, 0x0D, 0x00,
-                0x63, 0x61, 0x6D, 0x63, 0x61, 0x70, 0x5F, 0x63,
-                0x6F, 0x6D, 0x6D, 0x6F, 0x6E, 0x00, 0x00, 0x00,
-                0x00, (byte)0xD0, (byte)0x93,
-                (byte)0x92, 0x3A
-        };
-
-        final byte[] servicePacket2 = new byte[] {
-                (byte)0x55, (byte)0xCC, (byte)0x49, (byte)0x57,
-                0x1B, 0x00, 0x00, 0x00,
-                0x55, 0x1B, 0x04, 0x75, 0x02, 0x3C, (byte)0xF4, (byte)0xFE,
-                0x40, 0x00, (byte)0x88,
-                0x17, 0x00, 0x00, 0x23, 0x00,
-                0x41, 0x50, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x02, 0x58, (byte)0xA6,
-                0x34, 0x18
-        };
+        if (mode != 0 && mode != 1) return;
 
         try {
-            accessoryOutput.write(servicePacket1);
+            int seq = nextSequence();
+
+            byte[] duml = buildDumlPacket(
+                    0x02,       // App
+                    0x01,       // Camera
+                    seq,
+                    0,          // request
+                    2,          // ACK after execution
+                    0,          // no encryption
+                    0x02,       // Camera command set
+                    0x10,       // Camera Work Mode Set
+                    new byte[] {(byte) mode});
+
+            byte[] outer = wrapLogicLink(PORT_DUML, duml);
+
+            accessoryOutput.write(outer);
             accessoryOutput.flush();
 
-            try { Thread.sleep(80); } catch (InterruptedException ignored) {}
-
-            accessoryOutput.write(servicePacket2);
-            accessoryOutput.flush();
-
-            appendEvent("LOGICLINK: sequência experimental de serviço enviada uma vez.");
-            appendEvent("Agora procurando especificamente o PORT 0x574A (vídeo).");
-            statusView.setText("🎥 Procurando canal de vídeo 0x574A...");
-
-            listenForLogicLinkVideo(7500L);
+            appendLog(
+                    "TX Camera Work Mode Set -> " +
+                    (mode == 0 ? "FOTO" : "VÍDEO") +
+                    ", seq=" + seq);
 
         } catch (Throwable t) {
-            appendEvent("Falha ao enviar sequência LogicLink: "
-                    + t.getClass().getSimpleName() + " - " + safe(t.getMessage()));
-            statusView.setText("❌ Falha no teste LogicLink");
+            appendLog("Erro no TX: " +
+                    t.getClass().getSimpleName() +
+                    " - " + safe(t.getMessage()));
         }
     }
 
-    private void listenForLogicLinkVideo(final long timeoutMs) {
-        if (listening) return;
-        listening = true;
+    private int nextSequence() {
+        int seq = nextTxSequence & 0xFFFF;
 
-        listenThread = new Thread(() -> {
-            ByteArrayOutputStream rx = new ByteArrayOutputStream();
-            long deadline = System.currentTimeMillis() + timeoutMs;
-            byte[] buffer = new byte[16384];
-
-            try {
-                StructPollfd pollfd = new StructPollfd();
-                pollfd.fd = accessoryDescriptor.getFileDescriptor();
-                pollfd.events = (short) OsConstants.POLLIN;
-                StructPollfd[] pollfds = new StructPollfd[]{pollfd};
-
-                while (listening && System.currentTimeMillis() < deadline) {
-                    pollfd.revents = 0;
-                    int ready = Os.poll(pollfds, 120);
-
-                    if (!listening) break;
-
-                    if (ready > 0 && (pollfd.revents & OsConstants.POLLIN) != 0) {
-                        int count = accessoryInput.read(buffer);
-                        if (count < 0) break;
-
-                        if (count > 0) {
-                            // 8 MiB is enough to prove that the video port is alive
-                            // without allowing an unbounded diagnostic capture.
-                            int remaining = (8 * 1024 * 1024) - rx.size();
-                            if (remaining <= 0) break;
-
-                            int copy = Math.min(count, remaining);
-                            rx.write(buffer, 0, copy);
-
-                            // Once several hundred KB have arrived, that is already
-                            // enough to inspect the stream. Keep a small minimum time.
-                            if (rx.size() >= 6 * 1024 * 1024) break;
-                        }
-                    }
-                }
-            } catch (Throwable t) {
-                appendEventFromWorker("Erro lendo LogicLink: "
-                        + t.getClass().getSimpleName() + " - " + safe(t.getMessage()));
-            } finally {
-                listening = false;
-
-                final byte[] received = rx.toByteArray();
-                final String result = analyzeLogicLinkPorts(received);
-
-                runOnUiThread(() -> {
-                    appendEvent("=== LOGICLINK VIDEO TEST ===\\n" + result);
-                    if (result.contains("VÍDEO 0x574A DETECTADO")) {
-                        statusView.setText("✅ Canal de vídeo 0x574A encontrado!");
-                    } else {
-                        statusView.setText("🟡 0x574A não apareceu neste teste");
-                    }
-                });
-            }
-        }, "PocketLogicLinkVideoTest");
-
-        listenThread.start();
-    }
-
-    private String analyzeLogicLinkPorts(byte[] data) {
-        if (data == null || data.length < 8) {
-            return "Nenhum dado suficiente recebido.";
-        }
-
-        java.util.LinkedHashMap<Integer, Integer> packetCount =
-                new java.util.LinkedHashMap<>();
-        java.util.LinkedHashMap<Integer, Long> byteCount =
-                new java.util.LinkedHashMap<>();
-
-        ByteArrayOutputStream video = new ByteArrayOutputStream();
-
-        int validPackets = 0;
-        int malformedOrUnframed = 0;
-        int pos = 0;
-
-        while (pos < data.length) {
-            if (pos + 8 <= data.length
-                    && (data[pos] & 0xFF) == 0x55
-                    && (data[pos + 1] & 0xFF) == 0xCC) {
-
-                int port = (data[pos + 2] & 0xFF)
-                        | ((data[pos + 3] & 0xFF) << 8);
-
-                int len = (data[pos + 4] & 0xFF)
-                        | ((data[pos + 5] & 0xFF) << 8);
-
-                int unknown = (data[pos + 6] & 0xFF)
-                        | ((data[pos + 7] & 0xFF) << 8);
-
-                int payloadStart = pos + 8;
-                int payloadEnd = payloadStart + len;
-
-                if (unknown == 0 && len >= 0 && payloadEnd <= data.length) {
-                    validPackets++;
-
-                    Integer pc = packetCount.get(port);
-                    packetCount.put(port, pc == null ? 1 : pc + 1);
-
-                    Long bc = byteCount.get(port);
-                    byteCount.put(port, (bc == null ? 0L : bc) + len);
-
-                    if (port == 0x574A && len > 0) {
-                        int room = (2 * 1024 * 1024) - video.size();
-                        if (room > 0) {
-                            int copy = Math.min(len, room);
-                            video.write(data, payloadStart, copy);
-                        }
-                    }
-
-                    pos = payloadEnd;
-                    continue;
-                }
-            }
-
-            malformedOrUnframed++;
-            pos++;
-        }
-
-        byte[] videoBytes = video.toByteArray();
-        NalStats annexB = scanAnnexBNals(videoBytes);
-        NalStats avcc = scanAvccNals(videoBytes);
-
-        StringBuilder out = new StringBuilder();
-        out.append("Captura total: ").append(data.length).append(" bytes\\n");
-        out.append("Pacotes LogicLink válidos: ").append(validPackets).append("\\n");
-        out.append("Bytes não enquadrados durante a varredura: ")
-                .append(malformedOrUnframed).append("\\n\\n");
-
-        out.append("PORTAS ENCONTRADAS:\\n");
-        if (packetCount.isEmpty()) {
-            out.append("(nenhuma)\\n");
-        } else {
-            for (java.util.Map.Entry<Integer, Integer> e : packetCount.entrySet()) {
-                int port = e.getKey();
-                long bytes = byteCount.get(port);
-
-                out.append(String.format(Locale.US,
-                        "0x%04X : %d pacote(s), %d bytes",
-                        port, e.getValue(), bytes));
-
-                if (port == 0x5749) out.append("  ← CONTROLE DUML");
-                if (port == 0x574A) out.append("  ← VÍDEO");
-                out.append("\\n");
-            }
-        }
-
-        out.append("\\n");
-
-        if (packetCount.containsKey(0x574A)) {
-            out.append("*** VÍDEO 0x574A DETECTADO ***\\n");
-            out.append("Payload de vídeo coletado para análise: ")
-                    .append(videoBytes.length).append(" bytes\\n");
-            out.append("H.264 Annex-B: ").append(formatNalStats(annexB)).append("\\n");
-            out.append("H.264 AVCC: ").append(formatNalStats(avcc)).append("\\n");
-
-            if (videoBytes.length > 0) {
-                int preview = Math.min(videoBytes.length, 96);
-                byte[] p = new byte[preview];
-                System.arraycopy(videoBytes, 0, p, 0, preview);
-                out.append("Primeiros bytes do vídeo: ").append(toHex(p)).append("\\n");
-            }
-        } else {
-            out.append("PORT 0x574A não apareceu.\\n");
-            out.append("O canal 0x5749 continua sendo o controle. ")
-                    .append("A sequência pública de serviço não iniciou vídeo nesta tentativa.");
-        }
-
-        return out.toString();
-    }
-
-    private synchronized void sendReadOnlyCameraModeQuery() {
-        if (listening) {
-            Toast.makeText(this,
-                    "Espere a escuta de 10 s terminar antes do teste TX.",
-                    Toast.LENGTH_LONG).show();
-            return;
-        }
-
-        if (accessoryDescriptor == null || accessoryOutput == null || accessoryInput == null) {
-            openFirstAccessory();
-            if (accessoryDescriptor == null || accessoryOutput == null || accessoryInput == null) {
-                appendEvent("TX cancelado: não foi possível abrir o canal USB Accessory.");
-                return;
-            }
-        }
-
-        final int seq = nextTxSequence & 0xFFFF;
         nextTxSequence = (nextTxSequence + 1) & 0xFFFF;
         if (nextTxSequence == 0) nextTxSequence = 1;
 
-        try {
-            // Sender: App (2), Receiver: Camera (1)
-            // Request, ACK after execution, no encryption.
-            byte[] duml = buildDumlPacket(
-                    0x02, 0x01, seq,
-                    0, 2, 0,
-                    0x02, 0x11,
-                    new byte[0]);
-
-            byte[] transport = wrapPocketTransport(duml);
-
-            accessoryOutput.write(transport);
-            accessoryOutput.flush();
-
-            appendEvent("TX seguro enviado: Camera Work Mode Get (0x02/0x11), seq="
-                    + seq + ", " + transport.length + " bytes no transporte.");
-            appendEvent("DUML TX: " + toHex(duml));
-            statusView.setText("📤 Consulta enviada — aguardando resposta...");
-
-            listenForReadOnlyResponse(seq, 0x02, 0x11, 2200L);
-        } catch (Throwable t) {
-            appendEvent("Falha no TX seguro: " + t.getClass().getSimpleName()
-                    + " - " + safe(t.getMessage()));
-            statusView.setText("❌ Falha ao transmitir consulta");
-        }
-    }
-
-    private void listenForReadOnlyResponse(
-            final int expectedSeq,
-            final int expectedCmdSet,
-            final int expectedCmdId,
-            final long timeoutMs) {
-
-        if (listening) {
-            appendEvent("Leitor ocupado; resposta TX não será monitorada agora.");
-            return;
-        }
-
-        listening = true;
-
-        listenThread = new Thread(() -> {
-            ByteArrayOutputStream rx = new ByteArrayOutputStream();
-            long deadline = System.currentTimeMillis() + timeoutMs;
-            byte[] buffer = new byte[4096];
-
-            try {
-                StructPollfd pollfd = new StructPollfd();
-                pollfd.fd = accessoryDescriptor.getFileDescriptor();
-                pollfd.events = (short) OsConstants.POLLIN;
-                StructPollfd[] pollfds = new StructPollfd[]{pollfd};
-
-                while (listening && System.currentTimeMillis() < deadline) {
-                    pollfd.revents = 0;
-                    int ready = Os.poll(pollfds, 120);
-
-                    if (!listening) break;
-
-                    if (ready > 0 && (pollfd.revents & OsConstants.POLLIN) != 0) {
-                        int count = accessoryInput.read(buffer);
-                        if (count < 0) break;
-                        if (count > 0) {
-                            rx.write(buffer, 0, count);
-                            if (rx.size() >= 32768) break;
-                        }
-                    }
-                }
-            } catch (Throwable t) {
-                appendEventFromWorker("Erro ao aguardar resposta TX: "
-                        + t.getClass().getSimpleName() + " - " + safe(t.getMessage()));
-            } finally {
-                listening = false;
-
-                final byte[] received = rx.toByteArray();
-                final String result = findCommandResponse(
-                        received, expectedSeq, expectedCmdSet, expectedCmdId);
-
-                runOnUiThread(() -> {
-                    appendEvent("RESULTADO DO TESTE TX\n" + result);
-                    statusView.setText(accessoryDescriptor != null
-                            ? "🟢 Canal aberto — teste TX concluído"
-                            : "✅ Teste TX concluído");
-                });
-            }
-        }, "PocketReadOnlyTxResponse");
-
-        listenThread.start();
-    }
-
-    private String findCommandResponse(
-            byte[] data, int expectedSeq, int expectedCmdSet, int expectedCmdId) {
-
-        if (data == null || data.length == 0) {
-            return "Nenhum byte recebido após a consulta.";
-        }
-
-        int outerCount = 0;
-        int frameCount = 0;
-        int responseCount = 0;
-        StringBuilder matches = new StringBuilder();
-
-        int pos = 0;
-        while (pos + 8 <= data.length) {
-            if (!looksLikePocketTransportHeader(data, pos)) {
-                pos++;
-                continue;
-            }
-
-            long payloadLengthLong = readLe32(data, pos + 4);
-            if (payloadLengthLong < 0 || payloadLengthLong > Integer.MAX_VALUE) {
-                pos++;
-                continue;
-            }
-
-            int transportPayloadLength = (int) payloadLengthLong;
-            int payloadStart = pos + 8;
-            int payloadEnd = Math.min(data.length, payloadStart + transportPayloadLength);
-            outerCount++;
-
-            int p = payloadStart;
-            while (p + 13 <= payloadEnd) {
-                if ((data[p] & 0xFF) != 0x55) {
-                    p++;
-                    continue;
-                }
-
-                int frameLength =
-                        (data[p + 1] & 0xFF) | ((data[p + 2] & 0x03) << 8);
-
-                if (frameLength < 13 || p + frameLength > payloadEnd) {
-                    p++;
-                    continue;
-                }
-
-                frameCount++;
-
-                int sender = data[p + 4] & 0x1F;
-                int receiver = data[p + 5] & 0x1F;
-                int seq = (data[p + 6] & 0xFF) | ((data[p + 7] & 0xFF) << 8);
-                int cmdType = data[p + 8] & 0xFF;
-                int packetType = (cmdType >> 7) & 0x01;
-                int ackType = (cmdType >> 5) & 0x03;
-                int encryptType = cmdType & 0x07;
-                int cmdSet = data[p + 9] & 0xFF;
-                int cmdId = data[p + 10] & 0xFF;
-                int innerPayloadLength = frameLength - 13;
-                int innerPayloadStart = p + 11;
-
-                if (packetType == 1
-                        && cmdSet == expectedCmdSet
-                        && cmdId == expectedCmdId
-                        && seq == expectedSeq) {
-
-                    responseCount++;
-
-                    byte[] payload = new byte[Math.max(0, innerPayloadLength)];
-                    if (innerPayloadLength > 0) {
-                        System.arraycopy(
-                                data, innerPayloadStart,
-                                payload, 0, innerPayloadLength);
-                    }
-
-                    matches.append("Resposta #").append(responseCount)
-                            .append(": ")
-                            .append(sourceName(sender)).append(" → ")
-                            .append(sourceName(receiver))
-                            .append(", seq=").append(seq)
-                            .append(", ACK=").append(ackType)
-                            .append(", ENC=").append(encryptType)
-                            .append(", payload=").append(innerPayloadLength)
-                            .append(" byte(s)\n");
-
-                    matches.append("Payload HEX: ")
-                            .append(payload.length == 0 ? "(vazio)" : toHex(payload))
-                            .append("\n");
-
-                    if (payload.length == 1) {
-                        int value = payload[0] & 0xFF;
-                        matches.append("Possível modo retornado: ")
-                                .append(cameraModeName(value))
-                                .append(" (").append(value).append(")\n");
-                    } else if (payload.length >= 2) {
-                        int first = payload[0] & 0xFF;
-                        int second = payload[1] & 0xFF;
-                        matches.append("Primeiros valores: ")
-                                .append(first).append(", ").append(second)
-                                .append(". Se o primeiro for status=0, o segundo pode ser o modo: ")
-                                .append(cameraModeName(second))
-                                .append(" (").append(second).append(")\n");
-                    }
-
-                    matches.append("\n");
-                }
-
-                p += frameLength;
-            }
-
-            if (payloadStart + transportPayloadLength <= data.length) {
-                pos = payloadStart + transportPayloadLength;
-            } else {
-                break;
-            }
-        }
-
-        StringBuilder out = new StringBuilder();
-        out.append("Recebidos ").append(data.length).append(" bytes em ~2,2 s.\n");
-        out.append("Blocos DJI: ").append(outerCount)
-                .append(" | Quadros DUML: ").append(frameCount).append("\n");
-
-        if (responseCount == 0) {
-            out.append("Nenhuma resposta 0x")
-                    .append(hex2(expectedCmdSet)).append("/0x")
-                    .append(hex2(expectedCmdId))
-                    .append(" com seq=").append(expectedSeq)
-                    .append(" foi encontrada.\n")
-                    .append("Isso NÃO significa que o canal de saída está quebrado; ")
-                    .append("pode indicar que a Pocket usa outro envelope/ACK para comandos do app.");
-        } else {
-            out.append("Resposta correspondente encontrada: ")
-                    .append(responseCount).append("\n\n")
-                    .append(matches);
-        }
-
-        return out.toString();
+        return seq;
     }
 
     private byte[] buildDumlPacket(
-            int senderInfo,
-            int receiverInfo,
+            int sender,
+            int receiver,
             int seq,
             int packetType,
             int ackType,
@@ -1685,934 +815,475 @@ public class MainActivity extends Activity {
 
         if (payload == null) payload = new byte[0];
 
-        int wholeLength = 11 + payload.length + 2;
-        if (wholeLength > 1023) {
-            throw new IllegalArgumentException("Pacote DUML grande demais");
-        }
-
-        byte[] out = new byte[wholeLength];
+        int length = 11 + payload.length + 2;
+        byte[] out = new byte[length];
 
         out[0] = 0x55;
 
-        int verLengthTag = ((1 & 0x3F) << 10) | (wholeLength & 0x03FF);
-        out[1] = (byte) (verLengthTag & 0xFF);
-        out[2] = (byte) ((verLengthTag >> 8) & 0xFF);
+        int verLength = (1 << 10) | (length & 0x03FF);
+
+        out[1] = (byte) (verLength & 0xFF);
+        out[2] = (byte) ((verLength >> 8) & 0xFF);
 
         out[3] = (byte) crc8Dji(0x77, out, 0, 3);
 
-        out[4] = (byte) (senderInfo & 0xFF);
-        out[5] = (byte) (receiverInfo & 0xFF);
+        out[4] = (byte) sender;
+        out[5] = (byte) receiver;
+
         out[6] = (byte) (seq & 0xFF);
         out[7] = (byte) ((seq >> 8) & 0xFF);
 
-        int cmdTypeData =
-                ((packetType & 0x01) << 7)
-                | ((ackType & 0x03) << 5)
-                | (encryptType & 0x07);
+        out[8] = (byte) (
+                ((packetType & 1) << 7)
+                | ((ackType & 3) << 5)
+                | (encryptType & 7));
 
-        out[8] = (byte) cmdTypeData;
-        out[9] = (byte) (cmdSet & 0xFF);
-        out[10] = (byte) (cmdId & 0xFF);
+        out[9]  = (byte) cmdSet;
+        out[10] = (byte) cmdId;
 
         if (payload.length > 0) {
             System.arraycopy(payload, 0, out, 11, payload.length);
         }
 
-        int crc16 = crc16Dji(out, 0, wholeLength - 2);
-        out[wholeLength - 2] = (byte) (crc16 & 0xFF);
-        out[wholeLength - 1] = (byte) ((crc16 >> 8) & 0xFF);
+        int crc16 = crc16Dji(out, 0, length - 2);
+
+        out[length - 2] = (byte) (crc16 & 0xFF);
+        out[length - 1] = (byte) ((crc16 >> 8) & 0xFF);
 
         return out;
     }
 
-    private byte[] wrapPocketTransport(byte[] duml) {
-        byte[] out = new byte[8 + duml.length];
+    private byte[] wrapLogicLink(int port, byte[] payload) {
+        byte[] out = new byte[8 + payload.length];
 
         out[0] = 0x55;
         out[1] = (byte) 0xCC;
-        out[2] = 0x49;
-        out[3] = 0x57;
 
-        int length = duml.length;
+        out[2] = (byte) (port & 0xFF);
+        out[3] = (byte) ((port >> 8) & 0xFF);
+
+        int length = payload.length;
+
         out[4] = (byte) (length & 0xFF);
         out[5] = (byte) ((length >> 8) & 0xFF);
         out[6] = (byte) ((length >> 16) & 0xFF);
         out[7] = (byte) ((length >> 24) & 0xFF);
 
-        System.arraycopy(duml, 0, out, 8, duml.length);
+        System.arraycopy(payload, 0, out, 8, payload.length);
+
         return out;
     }
 
-    /**
-     * DJI DUML header CRC-8.
-     * Equivalente à tabela usada pelo dji-firmware-tools:
-     * seed 0x77, polinômio refletido 0x8C.
-     */
-    private int crc8Dji(int seed, byte[] data, int offset, int length) {
+    // -------------------------------------------------------------------------
+    // H.264 — pronto para quando a HG210 liberar 0x574A
+    // -------------------------------------------------------------------------
+
+    @Override
+    public void surfaceCreated(SurfaceHolder holder) {
+        previewSurface = holder.getSurface();
+
+        if (h264Decoder != null) {
+            h264Decoder.setSurface(previewSurface);
+        }
+    }
+
+    @Override
+    public void surfaceChanged(
+            SurfaceHolder holder,
+            int format,
+            int width,
+            int height) {
+
+        previewSurface = holder.getSurface();
+
+        if (h264Decoder != null) {
+            h264Decoder.setSurface(previewSurface);
+        }
+    }
+
+    @Override
+    public void surfaceDestroyed(SurfaceHolder holder) {
+        previewSurface = null;
+
+        if (h264Decoder != null) {
+            h264Decoder.release();
+        }
+    }
+
+    private final class H264AnnexBCollector {
+
+        private byte[] pending = new byte[0];
+
+        void push(byte[] chunk) {
+            if (chunk == null || chunk.length == 0) return;
+
+            byte[] merged =
+                    new byte[pending.length + chunk.length];
+
+            System.arraycopy(pending, 0, merged, 0, pending.length);
+            System.arraycopy(chunk, 0, merged, pending.length, chunk.length);
+
+            int first = findStartCode(merged, 0);
+
+            if (first < 0) {
+                // ainda não localizou Annex-B
+                if (merged.length > 2 * 1024 * 1024) {
+                    pending = Arrays.copyOfRange(
+                            merged,
+                            merged.length - 128 * 1024,
+                            merged.length);
+                } else {
+                    pending = merged;
+                }
+                return;
+            }
+
+            int current = first;
+
+            while (true) {
+                int startCodeLen = startCodeLength(merged, current);
+                int nalStart = current + startCodeLen;
+
+                int next = findStartCode(merged, nalStart);
+
+                if (next < 0) {
+                    pending = Arrays.copyOfRange(
+                            merged,
+                            current,
+                            merged.length);
+                    return;
+                }
+
+                if (nalStart < next) {
+                    byte[] nal =
+                            Arrays.copyOfRange(
+                                    merged,
+                                    nalStart,
+                                    next);
+
+                    processNal(nal);
+                }
+
+                current = next;
+            }
+        }
+
+        private void processNal(byte[] nal) {
+            if (nal == null || nal.length == 0) return;
+
+            int type = nal[0] & 0x1F;
+
+            if (type == 7) {
+                appendLog("H264 SPS recebido (" + nal.length + " bytes)");
+            } else if (type == 8) {
+                appendLog("H264 PPS recebido (" + nal.length + " bytes)");
+            } else if (type == 5 && h264Decoder != null) {
+                appendLog("H264 IDR recebido (" + nal.length + " bytes)");
+            }
+
+            if (h264Decoder != null) {
+                h264Decoder.feedNal(nal, type);
+            }
+        }
+
+        private int findStartCode(byte[] data, int from) {
+            for (int i = Math.max(0, from); i + 3 < data.length; i++) {
+                if (data[i] == 0
+                        && data[i + 1] == 0
+                        && data[i + 2] == 1) {
+                    return i;
+                }
+
+                if (i + 4 < data.length
+                        && data[i] == 0
+                        && data[i + 1] == 0
+                        && data[i + 2] == 0
+                        && data[i + 3] == 1) {
+                    return i;
+                }
+            }
+
+            return -1;
+        }
+
+        private int startCodeLength(byte[] data, int pos) {
+            if (pos + 3 < data.length
+                    && data[pos] == 0
+                    && data[pos + 1] == 0
+                    && data[pos + 2] == 1) {
+                return 3;
+            }
+
+            return 4;
+        }
+    }
+
+    private final class H264Decoder {
+
+        private MediaCodec codec;
+        private Surface surface;
+
+        private byte[] sps;
+        private byte[] pps;
+
+        private boolean started;
+        private long frameIndex;
+
+        synchronized void setSurface(Surface newSurface) {
+            surface = newSurface;
+
+            if (!started && sps != null && pps != null) {
+                startCodecIfReady();
+            }
+        }
+
+        synchronized void feedNal(byte[] nal, int type) {
+            if (nal == null || nal.length == 0) return;
+
+            if (type == 7) {
+                sps = Arrays.copyOf(nal, nal.length);
+                startCodecIfReady();
+                return;
+            }
+
+            if (type == 8) {
+                pps = Arrays.copyOf(nal, nal.length);
+                startCodecIfReady();
+                return;
+            }
+
+            if (!started) return;
+
+            if (type != 1 && type != 5 && type != 6) {
+                return;
+            }
+
+            try {
+                byte[] data = withStartCode(nal);
+
+                int inputIndex = codec.dequeueInputBuffer(0);
+
+                if (inputIndex >= 0) {
+                    ByteBuffer input = codec.getInputBuffer(inputIndex);
+
+                    if (input != null) {
+                        input.clear();
+
+                        if (data.length <= input.remaining()) {
+                            input.put(data);
+
+                            long ptsUs =
+                                    (frameIndex++ * 1_000_000L) / 30L;
+
+                            codec.queueInputBuffer(
+                                    inputIndex,
+                                    0,
+                                    data.length,
+                                    ptsUs,
+                                    type == 5
+                                            ? MediaCodec.BUFFER_FLAG_KEY_FRAME
+                                            : 0);
+                        }
+                    }
+                }
+
+                drain();
+
+            } catch (Throwable t) {
+                appendLog("Decoder H264: " +
+                        t.getClass().getSimpleName() +
+                        " - " + safe(t.getMessage()));
+            }
+        }
+
+        private void startCodecIfReady() {
+            if (started) return;
+            if (surface == null || !surface.isValid()) return;
+            if (sps == null || pps == null) return;
+
+            try {
+                codec =
+                        MediaCodec.createDecoderByType(
+                                MediaFormat.MIMETYPE_VIDEO_AVC);
+
+                MediaFormat format =
+                        MediaFormat.createVideoFormat(
+                                MediaFormat.MIMETYPE_VIDEO_AVC,
+                                1920,
+                                1080);
+
+                format.setByteBuffer(
+                        "csd-0",
+                        ByteBuffer.wrap(withStartCode(sps)));
+
+                format.setByteBuffer(
+                        "csd-1",
+                        ByteBuffer.wrap(withStartCode(pps)));
+
+                codec.configure(
+                        format,
+                        surface,
+                        null,
+                        0);
+
+                codec.start();
+                started = true;
+
+                runOnUiThread(() ->
+                        videoStateView.setText(
+                                "LIVE VIEW: H.264 decoder ativo"));
+
+                appendLog("MediaCodec AVC iniciado com SPS/PPS.");
+
+            } catch (Throwable t) {
+                appendLog("Falha iniciando MediaCodec: " +
+                        t.getClass().getSimpleName() +
+                        " - " + safe(t.getMessage()));
+
+                release();
+            }
+        }
+
+        private void drain() {
+            if (!started || codec == null) return;
+
+            MediaCodec.BufferInfo info =
+                    new MediaCodec.BufferInfo();
+
+            while (true) {
+                int outIndex =
+                        codec.dequeueOutputBuffer(info, 0);
+
+                if (outIndex >= 0) {
+                    codec.releaseOutputBuffer(outIndex, true);
+                } else if (outIndex ==
+                        MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+
+                    MediaFormat f = codec.getOutputFormat();
+
+                    appendLog(
+                            "Formato de vídeo detectado: " +
+                            f.toString());
+
+                } else {
+                    break;
+                }
+            }
+        }
+
+        synchronized void release() {
+            started = false;
+
+            if (codec != null) {
+                try {
+                    codec.stop();
+                } catch (Throwable ignored) {
+                }
+
+                try {
+                    codec.release();
+                } catch (Throwable ignored) {
+                }
+            }
+
+            codec = null;
+        }
+
+        private byte[] withStartCode(byte[] nal) {
+            byte[] out = new byte[nal.length + 4];
+
+            out[0] = 0;
+            out[1] = 0;
+            out[2] = 0;
+            out[3] = 1;
+
+            System.arraycopy(
+                    nal, 0,
+                    out, 4,
+                    nal.length);
+
+            return out;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // CRC / util
+    // -------------------------------------------------------------------------
+
+    private int crc8Dji(
+            int seed,
+            byte[] data,
+            int offset,
+            int length) {
+
         int crc = seed & 0xFF;
 
         for (int i = 0; i < length; i++) {
             crc ^= data[offset + i] & 0xFF;
 
             for (int bit = 0; bit < 8; bit++) {
-                if ((crc & 0x01) != 0) {
+                if ((crc & 1) != 0) {
                     crc = (crc >> 1) ^ 0x8C;
                 } else {
                     crc >>= 1;
                 }
+
                 crc &= 0xFF;
             }
         }
 
-        return crc & 0xFF;
+        return crc;
     }
 
-    /**
-     * DJI DUML packet CRC-16.
-     * Seed 0x3692; implementação bit a bit equivalente à tabela
-     * usada pelo dji-firmware-tools.
-     */
-    private int crc16Dji(byte[] data, int offset, int length) {
+    private int crc16Dji(
+            byte[] data,
+            int offset,
+            int length) {
+
         int crc = 0x3692;
 
         for (int i = 0; i < length; i++) {
             crc ^= data[offset + i] & 0xFF;
 
             for (int bit = 0; bit < 8; bit++) {
-                if ((crc & 0x0001) != 0) {
+                if ((crc & 1) != 0) {
                     crc = (crc >> 1) ^ 0x8408;
                 } else {
                     crc >>= 1;
                 }
+
                 crc &= 0xFFFF;
             }
         }
 
-        return crc & 0xFFFF;
+        return crc;
     }
 
-    private synchronized void closeAccessoryChannel() {
-        listening = false;
-
-        if (accessoryInput != null) {
-            try {
-                accessoryInput.close();
-            } catch (Exception ignored) {
-            }
-            accessoryInput = null;
-        }
-
-        if (accessoryOutput != null) {
-            try {
-                accessoryOutput.close();
-            } catch (Exception ignored) {
-            }
-            accessoryOutput = null;
-        }
-
-        if (accessoryDescriptor != null) {
-            try {
-                accessoryDescriptor.close();
-            } catch (Exception ignored) {
-            }
-            accessoryDescriptor = null;
-            appendEvent("Canal USB fechado.");
-        }
-
-        refreshUsb();
-    }
-
-    private void startPassiveListen() {
-        if (listening) {
-            Toast.makeText(this, "A escuta já está em andamento.", Toast.LENGTH_SHORT).show();
-            return;
-        }
-
-        if (accessoryDescriptor == null || accessoryInput == null) {
-            openFirstAccessory();
-            if (accessoryDescriptor == null || accessoryInput == null) {
-                appendEvent("Não foi possível iniciar a escuta: canal não abriu.");
-                return;
-            }
-        }
-
-        listening = true;
-        captureBuffer.reset();
-        appendEvent("Escuta passiva iniciada por 10 segundos. Não enviaremos comandos.");
-        statusView.setText("👂 Escutando a Osmo por 10 s...");
-
-        listenThread = new Thread(() -> {
-            long deadline = System.currentTimeMillis() + 10_000L;
-            int total = 0;
-            int chunks = 0;
-            byte[] buffer = new byte[4096];
-
-            try {
-                StructPollfd pollfd = new StructPollfd();
-                pollfd.fd = accessoryDescriptor.getFileDescriptor();
-                pollfd.events = (short) OsConstants.POLLIN;
-                StructPollfd[] pollfds = new StructPollfd[]{pollfd};
-
-                while (listening && System.currentTimeMillis() < deadline) {
-                    pollfd.revents = 0;
-                    int ready = Os.poll(pollfds, 250);
-                    if (!listening) {
-                        break;
-                    }
-
-                    if (ready > 0 && (pollfd.revents & OsConstants.POLLIN) != 0) {
-                        int count = accessoryInput.read(buffer);
-                        if (count < 0) {
-                            appendEventFromWorker("A câmera encerrou o fluxo de leitura.");
-                            break;
-                        }
-                        if (count > 0) {
-                            total += count;
-                            chunks++;
-                            byte[] packet = new byte[count];
-                            System.arraycopy(buffer, 0, packet, 0, count);
-                            captureBuffer.write(packet, 0, packet.length);
-                            appendEventFromWorker("RX #" + chunks + " — " + count + " bytes");
-
-                            if (total >= 65536) {
-                                appendEventFromWorker("Limite de captura atingido (64 KiB).");
-                                break;
-                            }
-                        }
-                    }
-                }
-            } catch (Throwable t) {
-                if (listening) {
-                    appendEventFromWorker("Erro durante leitura: "
-                            + t.getClass().getSimpleName() + " - " + safe(t.getMessage()));
-                }
-            } finally {
-                listening = false;
-                final int bytes = total;
-                final int packetCount = chunks;
-                final byte[] captured = captureBuffer.toByteArray();
-                final String automaticAnalysis = analyzeCapture(captured);
-                runOnUiThread(() -> {
-                    appendEvent("Escuta finalizada: " + bytes + " bytes em "
-                            + packetCount + " bloco(s).");
-                    appendEvent("ANÁLISE AUTOMÁTICA DA CAPTURA\n" + automaticAnalysis);
-                    if (bytes == 0) {
-                        appendEvent("Zero bytes não significa falha: a Pocket pode esperar "
-                                + "um comando de protocolo antes de responder.");
-                    }
-                    statusView.setText(accessoryDescriptor != null
-                            ? "🟢 Canal aberto — escuta concluída"
-                            : "✅ Osmo Pocket detectada");
-                });
-            }
-        }, "PocketPassiveReader");
-
-        listenThread.start();
-    }
-
-    private void stopListening() {
-        listening = false;
-        Thread t = listenThread;
-        listenThread = null;
-        if (t != null) {
-            t.interrupt();
-        }
-    }
-
-
-    private String analyzeCapture(byte[] data) {
-        if (data == null || data.length == 0) {
-            return "Nenhum byte disponível para análise.";
-        }
-
-        HashMap<String, Integer> commandCounts = new HashMap<>();
-
-        int outerCount = 0;
-        int frameCount = 0;
-        int pos = 0;
-
-        // CAMERA 0x80 - Camera State Info
-        boolean haveCameraState = false;
-        int cameraFlags = 0;
-        int cameraMode = -1;
-        int cameraRecordState = -1;
-        int cameraPhotoState = -1;
-        boolean cameraConnected = false;
-        boolean cameraUsbState = false;
-        boolean cameraTimeSynced = false;
-        boolean cameraSdInserted = false;
-        int cameraSdState = -1;
-        long cameraSdTotal = -1;
-        long cameraSdFree = -1;
-        long cameraRemainingShots = -1;
-        long cameraRemainingTime = -1;
-        int cameraRecordTime = -1;
-        boolean cameraHistogramEnabled = false;
-        int cameraType = -1;
-        int cameraStateVersion = -1;
-
-        // CAMERA 0x81 - Camera Shot Params
-        boolean haveShotParams = false;
-        int apertureRaw = -1;
-        int shutterRaw = -1;
-        int shutterDecimal = -1;
-        int isoCode = -1;
-        int exposureCompRaw = -1;
-        int imageRatioCode = -1;
-        int videoFormatCode = -1;
-        int videoFpsCode = -1;
-        int videoFovCode = -1;
-        int exposureModeCode = -1;
-        int whiteBalanceCode = -1;
-        int colorTempCode = -1;
-        int antiFlickerCode = -1;
-
-        // GIMBAL 0x05 - Gimbal Params / Push Position
-        boolean haveGimbal = false;
-        double gimbalPitch = 0.0;
-        double gimbalRoll = 0.0;
-        double gimbalYaw = 0.0;
-        int gimbalMode = -1;
-        boolean gimbalPitchLimit = false;
-        boolean gimbalRollLimit = false;
-        boolean gimbalYawLimit = false;
-        boolean gimbalCalibrating = false;
-        boolean gimbalStuck = false;
-        int gimbalVersion = -1;
-
-        while (pos + 8 <= data.length) {
-            if (!looksLikePocketTransportHeader(data, pos)) {
-                pos++;
-                continue;
-            }
-
-            long payloadLengthLong = readLe32(data, pos + 4);
-            if (payloadLengthLong < 0 || payloadLengthLong > Integer.MAX_VALUE) {
-                pos++;
-                continue;
-            }
-
-            int payloadLength = (int) payloadLengthLong;
-            int payloadStart = pos + 8;
-            int payloadEnd = payloadStart + payloadLength;
-
-            if (payloadEnd > data.length) {
-                payloadEnd = data.length;
-            }
-
-            outerCount++;
-
-            int p = payloadStart;
-            while (p + 13 <= payloadEnd) {
-                if ((data[p] & 0xFF) != 0x55) {
-                    p++;
-                    continue;
-                }
-
-                int b1 = data[p + 1] & 0xFF;
-                int b2 = data[p + 2] & 0xFF;
-                int frameLength = b1 | ((b2 & 0x03) << 8);
-
-                if (frameLength < 13 || p + frameLength > payloadEnd) {
-                    p++;
-                    continue;
-                }
-
-                int sender = data[p + 4] & 0xFF;
-                int receiver = data[p + 5] & 0xFF;
-                int cmdSet = data[p + 9] & 0xFF;
-                int cmdId = data[p + 10] & 0xFF;
-                int innerPayloadStart = p + 11;
-                int innerPayloadLength = frameLength - 13;
-
-                frameCount++;
-
-                String key = sourceName(sender)
-                        + " → " + sourceName(receiver)
-                        + " | " + commandName(cmdSet, cmdId)
-                        + " [set 0x" + hex2(cmdSet)
-                        + ", id 0x" + hex2(cmdId) + "]";
-
-                Integer oldCount = commandCounts.get(key);
-                commandCounts.put(key, oldCount == null ? 1 : oldCount + 1);
-
-                // Camera State Info (0x80)
-                if (cmdSet == 0x02 && cmdId == 0x80 && innerPayloadLength >= 5) {
-                    cameraFlags = readLe32Int(data, innerPayloadStart);
-                    cameraMode = data[innerPayloadStart + 4] & 0xFF;
-
-                    cameraConnected = (cameraFlags & 0x0001) != 0;
-                    cameraUsbState = (cameraFlags & 0x0002) != 0;
-                    cameraTimeSynced = (cameraFlags & 0x0004) != 0;
-                    cameraPhotoState = (cameraFlags >> 3) & 0x07;
-                    cameraRecordState = (cameraFlags >> 6) & 0x03;
-                    cameraSdInserted = (cameraFlags & 0x0200) != 0;
-                    cameraSdState = (cameraFlags >> 10) & 0x0F;
-
-                    if (innerPayloadLength >= 37) {
-                        cameraSdTotal = readLe32Unsigned(data, innerPayloadStart + 5);
-                        cameraSdFree = readLe32Unsigned(data, innerPayloadStart + 9);
-                        cameraRemainingShots = readLe32Unsigned(data, innerPayloadStart + 13);
-                        cameraRemainingTime = readLe32Unsigned(data, innerPayloadStart + 17);
-                        cameraRecordTime = readLe16Unsigned(data, innerPayloadStart + 29);
-                        cameraHistogramEnabled =
-                                (data[innerPayloadStart + 32] & 0x01) != 0;
-                        cameraType = data[innerPayloadStart + 33] & 0xFF;
-                        cameraStateVersion = data[innerPayloadStart + 36] & 0xFF;
-                    }
-
-                    haveCameraState = true;
-                }
-
-                // Camera Shot Params (0x81)
-                if (cmdSet == 0x02 && cmdId == 0x81 && innerPayloadLength >= 25) {
-                    apertureRaw = readLe16Unsigned(data, innerPayloadStart);
-                    shutterRaw = readLe16Unsigned(data, innerPayloadStart + 2);
-                    shutterDecimal = data[innerPayloadStart + 4] & 0xFF;
-                    isoCode = data[innerPayloadStart + 5] & 0xFF;
-                    exposureCompRaw = data[innerPayloadStart + 6] & 0xFF;
-                    imageRatioCode = data[innerPayloadStart + 10] & 0xFF;
-                    videoFormatCode = data[innerPayloadStart + 13] & 0xFF;
-                    videoFpsCode = data[innerPayloadStart + 14] & 0xFF;
-                    videoFovCode = data[innerPayloadStart + 15] & 0xFF;
-                    exposureModeCode = data[innerPayloadStart + 20] & 0xFF;
-                    whiteBalanceCode = data[innerPayloadStart + 23] & 0xFF;
-                    colorTempCode = data[innerPayloadStart + 24] & 0xFF;
-
-                    if (innerPayloadLength >= 34) {
-                        antiFlickerCode = data[innerPayloadStart + 33] & 0xFF;
-                    }
-
-                    haveShotParams = true;
-                }
-
-                // Gimbal Params / Push Position (0x05)
-                if (cmdSet == 0x04 && cmdId == 0x05 && innerPayloadLength >= 7) {
-                    int pitchRaw = readLe16Signed(data, innerPayloadStart);
-                    int rollRaw = readLe16Signed(data, innerPayloadStart + 2);
-                    int yawRaw = readLe16Signed(data, innerPayloadStart + 4);
-                    int modeByte = data[innerPayloadStart + 6] & 0xFF;
-
-                    gimbalPitch = pitchRaw / 10.0;
-                    gimbalRoll = rollRaw / 10.0;
-                    gimbalYaw = yawRaw / 10.0;
-                    gimbalMode = (modeByte >> 6) & 0x03;
-
-                    if (innerPayloadLength >= 12) {
-                        int flags10 = data[innerPayloadStart + 10] & 0xFF;
-                        int flags11 = data[innerPayloadStart + 11] & 0xFF;
-
-                        gimbalPitchLimit = (flags10 & 0x01) != 0;
-                        gimbalRollLimit = (flags10 & 0x02) != 0;
-                        gimbalYawLimit = (flags10 & 0x04) != 0;
-                        gimbalCalibrating = (flags10 & 0x08) != 0;
-                        gimbalStuck = (flags10 & 0x40) != 0;
-                        gimbalVersion = flags11 & 0x0F;
-                    }
-
-                    haveGimbal = true;
-                }
-
-                p += frameLength;
-            }
-
-            if (payloadStart + payloadLength <= data.length) {
-                pos = payloadStart + payloadLength;
-            } else {
-                break;
-            }
-        }
-
-        StringBuilder out = new StringBuilder();
-        out.append("Total capturado: ").append(data.length).append(" bytes\n");
-        out.append("Blocos USB DJI encontrados: ").append(outerCount).append("\n");
-        out.append("Quadros DUML completos: ").append(frameCount).append("\n\n");
-
-        if (haveCameraState) {
-            out.append("=== CÂMERA ===\n");
-            out.append("Modo: ").append(cameraModeName(cameraMode))
-                    .append(" (").append(cameraMode).append(")\n");
-            out.append("Conectada: ").append(cameraConnected ? "SIM" : "NÃO").append("\n");
-            out.append("USB ativo: ").append(cameraUsbState ? "SIM" : "NÃO").append("\n");
-            out.append("Hora sincronizada: ").append(cameraTimeSynced ? "SIM" : "NÃO").append("\n");
-            out.append("Estado de foto: ").append(photoStateName(cameraPhotoState))
-                    .append(" (").append(cameraPhotoState).append(")\n");
-            out.append("Estado de gravação: ").append(recordStateName(cameraRecordState))
-                    .append(" (").append(cameraRecordState).append(")\n");
-            out.append("Cartão SD inserido: ").append(cameraSdInserted ? "SIM" : "NÃO").append("\n");
-            out.append("Estado SD: ").append(sdStateName(cameraSdState))
-                    .append(" (").append(cameraSdState).append(")\n");
-
-            if (cameraSdTotal >= 0) {
-                out.append("SD total (valor bruto): ").append(cameraSdTotal).append("\n");
-                out.append("SD livre (valor bruto): ").append(cameraSdFree).append("\n");
-                out.append("Fotos restantes: ").append(cameraRemainingShots).append("\n");
-                out.append("Tempo restante (valor bruto): ").append(cameraRemainingTime).append("\n");
-                out.append("Tempo de gravação atual: ").append(cameraRecordTime).append("\n");
-                out.append("Histograma ativo: ")
-                        .append(cameraHistogramEnabled ? "SIM" : "NÃO").append("\n");
-                out.append("Tipo de câmera (código): 0x").append(hex2(cameraType)).append("\n");
-                out.append("Versão do estado: ").append(cameraStateVersion).append("\n");
-            }
-
-            out.append("Flags: 0x")
-                    .append(String.format(Locale.US, "%08X", cameraFlags))
-                    .append("\n\n");
-        }
-
-        if (haveShotParams) {
-            out.append("=== AJUSTES DE CAPTURA ===\n");
-            out.append("ISO: ").append(isoName(isoCode))
-                    .append(" (código ").append(isoCode).append(")\n");
-            out.append("Exposição: ").append(exposureModeName(exposureModeCode))
-                    .append(" (código ").append(exposureModeCode).append(")\n");
-            out.append("Obturador bruto: 0x")
-                    .append(String.format(Locale.US, "%04X", shutterRaw))
-                    .append(" / decimal ").append(shutterDecimal).append("\n");
-            out.append("Abertura bruta: 0x")
-                    .append(String.format(Locale.US, "%04X", apertureRaw)).append("\n");
-            out.append("Compensação EV (código bruto): ").append(exposureCompRaw).append("\n");
-            out.append("Proporção da foto: ").append(imageRatioName(imageRatioCode))
-                    .append(" (").append(imageRatioCode).append(")\n");
-            out.append("Formato de vídeo (código): ").append(videoFormatCode).append("\n");
-            out.append("FPS de vídeo (código): ").append(videoFpsCode).append("\n");
-            out.append("FOV de vídeo (código): ").append(videoFovCode).append("\n");
-            out.append("Balanço de branco (código): ").append(whiteBalanceCode).append("\n");
-            out.append("Temperatura de cor (código): ").append(colorTempCode).append("\n");
-            if (antiFlickerCode >= 0) {
-                out.append("Anti-flicker (código): ").append(antiFlickerCode).append("\n");
-            }
-            out.append("\n");
-        }
-
-        if (haveGimbal) {
-            out.append("=== GIMBAL ===\n");
-            out.append(String.format(Locale.US,
-                    "Pitch bruto: %.1f° | Roll bruto: %.1f° | Yaw bruto: %.1f°\n",
-                    gimbalPitch, gimbalRoll, gimbalYaw));
-            out.append("Modo: ").append(gimbalModeName(gimbalMode))
-                    .append(" (").append(gimbalMode).append(")\n");
-            out.append("Pitch no limite: ").append(gimbalPitchLimit ? "SIM" : "NÃO").append("\n");
-            out.append("Roll no limite: ").append(gimbalRollLimit ? "SIM" : "NÃO").append("\n");
-            out.append("Yaw no limite: ").append(gimbalYawLimit ? "SIM" : "NÃO").append("\n");
-            out.append("Calibrando: ").append(gimbalCalibrating ? "SIM" : "NÃO").append("\n");
-            out.append("Travado/stuck: ").append(gimbalStuck ? "SIM" : "NÃO").append("\n");
-            if (gimbalVersion >= 0) {
-                out.append("Versão do pacote do gimbal: ").append(gimbalVersion).append("\n");
-            }
-            out.append("Obs.: estes ângulos são coordenadas brutas do protocolo DJI.\n\n");
-        }
-
-        out.append("=== MENSAGENS OBSERVADAS ===\n");
-        for (java.util.Map.Entry<String, Integer> entry : commandCounts.entrySet()) {
-            out.append(entry.getValue()).append("x  ")
-                    .append(entry.getKey()).append("\n");
-        }
-
-        out.append("\n1.3 testa de forma direcionada o serviço LogicLink e procura o port 0x574A de vídeo.");
-
-        return out.toString();
-    }
-
-    private int readLe32Int(byte[] data, int offset) {
-        if (offset < 0 || offset + 4 > data.length) return 0;
+    private int readLe16(byte[] data, int offset) {
         return (data[offset] & 0xFF)
-                | ((data[offset + 1] & 0xFF) << 8)
-                | ((data[offset + 2] & 0xFF) << 16)
-                | ((data[offset + 3] & 0xFF) << 24);
-    }
-
-    private long readLe32Unsigned(byte[] data, int offset) {
-        if (offset < 0 || offset + 4 > data.length) return -1;
-        return ((long) data[offset] & 0xFFL)
-                | (((long) data[offset + 1] & 0xFFL) << 8)
-                | (((long) data[offset + 2] & 0xFFL) << 16)
-                | (((long) data[offset + 3] & 0xFFL) << 24);
-    }
-
-    private int readLe16Unsigned(byte[] data, int offset) {
-        if (offset < 0 || offset + 2 > data.length) return 0;
-        return (data[offset] & 0xFF) | ((data[offset + 1] & 0xFF) << 8);
-    }
-
-    private int readLe16Signed(byte[] data, int offset) {
-        if (offset < 0 || offset + 2 > data.length) return 0;
-        int value = (data[offset] & 0xFF) | ((data[offset + 1] & 0xFF) << 8);
-        if ((value & 0x8000) != 0) value -= 0x10000;
-        return value;
-    }
-
-    private String sourceName(int id) {
-        switch (id & 0x1F) {
-            case 1: return "Câmera";
-            case 2: return "App";
-            case 4: return "Gimbal";
-            case 5: return "Placa central";
-            default: return "Módulo 0x" + hex2(id);
-        }
-    }
-
-    private String commandName(int cmdSet, int cmdId) {
-        if (cmdSet == 0x02) {
-            switch (cmdId) {
-                case 0x01: return "Capturar foto";
-                case 0x02: return "Gravar vídeo";
-                case 0x10: return "Definir modo da câmera";
-                case 0x11: return "Ler modo da câmera";
-                case 0x18: return "Definir formato de vídeo";
-                case 0x19: return "Ler formato de vídeo";
-                case 0x28: return "Definir obturador";
-                case 0x29: return "Ler obturador";
-                case 0x2A: return "Definir ISO";
-                case 0x2B: return "Ler ISO";
-                case 0x2C: return "Definir balanço de branco";
-                case 0x2D: return "Ler balanço de branco";
-                case 0x2E: return "Definir EV";
-                case 0x2F: return "Ler EV";
-                case 0x60: return "Definir histograma";
-                case 0x61: return "Ler histograma";
-                case 0x70: return "Ler estado do sistema";
-                case 0x71: return "Ler cartão SD";
-                case 0x7C: return "Comando do obturador";
-                case 0x80: return "Estado da câmera";
-                case 0x81: return "Parâmetros de captura";
-                case 0x83: return "Dados do histograma";
-                case 0x87: return "Informações de captura/lente";
-                case 0x88: return "Parâmetros de timelapse";
-                case 0x8A: return "Parâmetros de FOV";
-                default: return "Câmera cmd 0x" + hex2(cmdId);
-            }
-        }
-
-        if (cmdSet == 0x04) {
-            switch (cmdId) {
-                case 0x01: return "Controle do gimbal";
-                case 0x05: return "Posição/estado do gimbal";
-                case 0x0A: return "Controle por ângulo";
-                case 0x0C: return "Controle por velocidade";
-                case 0x14: return "Controle de ângulo absoluto";
-                case 0x15: return "Movimento do gimbal";
-                case 0x1C: return "Tipo do gimbal";
-                case 0x27: return "Estado anormal do gimbal";
-                case 0x33: return "Bateria do gimbal";
-                case 0x37: return "Parâmetros de timelapse do gimbal";
-                case 0x38: return "Estado de timelapse do gimbal";
-                case 0x4C: return "Reset/Modo do gimbal";
-                case 0x57: return "Estado do joystick";
-                case 0x58: return "Controle do joystick";
-                default: return "Gimbal cmd 0x" + hex2(cmdId);
-            }
-        }
-
-        if (cmdSet == 0x00) return "Geral cmd 0x" + hex2(cmdId);
-        if (cmdSet == 0x05) return "Placa central cmd 0x" + hex2(cmdId);
-
-        return "CmdSet 0x" + hex2(cmdSet) + " cmd 0x" + hex2(cmdId);
-    }
-
-    private String cameraModeName(int mode) {
-        switch (mode) {
-            case 0: return "FOTO";
-            case 1: return "VÍDEO";
-            case 2: return "PLAYBACK";
-            case 3: return "TRANSCODE";
-            case 4: return "AJUSTE";
-            case 5: return "ECONOMIA";
-            case 6: return "DOWNLOAD";
-            case 7: return "NOVO PLAYBACK";
-            default: return "DESCONHECIDO";
-        }
-    }
-
-    private String photoStateName(int state) {
-        switch (state) {
-            case 0: return "Nenhuma captura";
-            case 1: return "Foto única";
-            case 2: return "Múltiplas";
-            case 3: return "HDR";
-            case 4: return "Panorama/FullView";
-            default: return "Outro";
-        }
-    }
-
-    private String recordStateName(int state) {
-        switch (state) {
-            case 0: return "Parada";
-            case 1: return "Estado 1";
-            case 2: return "Estado 2";
-            case 3: return "Estado 3";
-            default: return "Desconhecido";
-        }
-    }
-
-    private String sdStateName(int state) {
-        switch (state) {
-            case 0: return "Normal";
-            case 1: return "Sem cartão";
-            case 2: return "Inválido";
-            case 3: return "Protegido contra gravação";
-            case 4: return "Não formatado";
-            case 5: return "Formatando";
-            case 6: return "Ilegal/incompatível";
-            case 7: return "Ocupado";
-            case 8: return "Cheio";
-            case 9: return "Lento";
-            case 10: return "Desconhecido";
-            case 11: return "Índice máximo";
-            case 12: return "Inicializando";
-            case 13: return "Precisa formatar";
-            case 14: return "Tentando recuperar arquivo";
-            case 15: return "Ficou lento";
-            default: return "Estado " + state;
-        }
-    }
-
-    private String isoName(int code) {
-        switch (code) {
-            case 0: return "AUTO";
-            case 1: return "AUTO HIGH";
-            case 2: return "ISO 50";
-            case 3: return "ISO 100";
-            case 4: return "ISO 200";
-            case 5: return "ISO 400";
-            case 6: return "ISO 800";
-            case 7: return "ISO 1600";
-            case 8: return "ISO 3200";
-            case 9: return "ISO 6400";
-            case 10: return "ISO 12800";
-            case 11: return "ISO 25600";
-            default: return "Código " + code;
-        }
-    }
-
-    private String exposureModeName(int mode) {
-        switch (mode) {
-            case 1: return "Program";
-            case 2: return "Prioridade do obturador";
-            case 3: return "Prioridade de abertura";
-            case 4: return "Manual";
-            case 7: return "Cine";
-            default: return "Código " + mode;
-        }
-    }
-
-    private String imageRatioName(int code) {
-        switch (code) {
-            case 0: return "4:3";
-            case 1: return "16:9";
-            case 2: return "3:2";
-            default: return "Outro";
-        }
-    }
-
-    private String gimbalModeName(int mode) {
-        switch (mode) {
-            case 0: return "Yaw sem Follow";
-            case 1: return "FPV";
-            case 2: return "Follow";
-            case 3: return "Auto calibração";
-            default: return "Desconhecido";
-        }
-    }
-
-    private boolean looksLikePocketTransportHeader(byte[] data, int offset) {
-        return offset + 8 <= data.length
-                && (data[offset] & 0xFF) == 0x55
-                && (data[offset + 1] & 0xFF) == 0xCC
-                && (data[offset + 2] & 0xFF) == 0x49
-                && (data[offset + 3] & 0xFF) == 0x57;
-    }
-
-    private long readLe32(byte[] data, int offset) {
-        if (offset < 0 || offset + 4 > data.length) {
-            return -1;
-        }
-        return ((long) data[offset] & 0xFFL)
-                | (((long) data[offset + 1] & 0xFFL) << 8)
-                | (((long) data[offset + 2] & 0xFFL) << 16)
-                | (((long) data[offset + 3] & 0xFFL) << 24);
-    }
-
-    private String toHexRange(byte[] data, int offset, int length) {
-        if (data == null || offset < 0 || length <= 0 || offset >= data.length) {
-            return "";
-        }
-
-        int end = Math.min(data.length, offset + length);
-        StringBuilder sb = new StringBuilder();
-        for (int i = offset; i < end; i++) {
-            if (i > offset) sb.append(' ');
-            sb.append(String.format(Locale.US, "%02X", data[i] & 0xFF));
-        }
-        return sb.toString();
-    }
-
-    private String hex2(int value) {
-        return String.format(Locale.US, "%02X", value & 0xFF);
-    }
-
-    private String describeDeviceStructure(UsbDevice d) {
-        StringBuilder out = new StringBuilder();
-        try {
-            out.append("Configurações: ").append(d.getConfigurationCount()).append("\n");
-            for (int c = 0; c < d.getConfigurationCount(); c++) {
-                UsbConfiguration cfg = d.getConfiguration(c);
-                out.append("  Config #").append(c)
-                        .append(" interfaces=").append(cfg.getInterfaceCount())
-                        .append("\n");
-                for (int i = 0; i < cfg.getInterfaceCount(); i++) {
-                    UsbInterface intf = cfg.getInterface(i);
-                    out.append("    Interface #").append(i)
-                            .append(" id=").append(intf.getId())
-                            .append(" class=").append(intf.getInterfaceClass())
-                            .append(" subclass=").append(intf.getInterfaceSubclass())
-                            .append(" protocol=").append(intf.getInterfaceProtocol())
-                            .append(" endpoints=").append(intf.getEndpointCount())
-                            .append("\n");
-                    for (int e = 0; e < intf.getEndpointCount(); e++) {
-                        UsbEndpoint ep = intf.getEndpoint(e);
-                        out.append("      EP #").append(e)
-                                .append(" addr=0x").append(Integer.toHexString(ep.getAddress()))
-                                .append(" dir=").append(ep.getDirection())
-                                .append(" type=").append(ep.getType())
-                                .append(" maxPacket=").append(ep.getMaxPacketSize())
-                                .append("\n");
-                    }
-                }
-            }
-        } catch (Throwable t) {
-            out.append("  Falha ao ler interfaces/endpoints: ")
-                    .append(t.getClass().getSimpleName()).append("\n");
-        }
-        return out.toString();
-    }
-
-    private void testOpenDevice(UsbDevice d) {
-        UsbDeviceConnection connection = null;
-        try {
-            connection = usbManager.openDevice(d);
-            if (connection != null) {
-                appendEvent("Canal USB Device abriu com sucesso. fd="
-                        + connection.getFileDescriptor());
-            } else {
-                appendEvent("Android retornou null ao abrir USB Device.");
-            }
-        } catch (Throwable t) {
-            appendEvent("Falha ao abrir USB Device: " + t.getClass().getSimpleName()
-                    + " - " + safe(t.getMessage()));
-        } finally {
-            if (connection != null) {
-                try {
-                    connection.close();
-                } catch (Exception ignored) {
-                }
-            }
-        }
-    }
-
-    private void copyDiagnostic() {
-        ClipboardManager clipboard = (ClipboardManager)
-                getSystemService(Context.CLIPBOARD_SERVICE);
-        if (clipboard != null) {
-            clipboard.setPrimaryClip(ClipData.newPlainText(
-                    "Pocket Control diagnóstico", lastDiagnostic));
-            Toast.makeText(this, "Diagnóstico copiado.", Toast.LENGTH_SHORT).show();
-        }
-    }
-
-    private void appendEvent(String message) {
-        if (message == null) return;
-        eventLog.append("\n[EVENTO] ").append(message).append("\n");
-        renderLog();
-    }
-
-    private void appendEventFromWorker(String message) {
-        runOnUiThread(() -> appendEvent(message));
-    }
-
-    private void renderLog() {
-        lastDiagnostic = baseDiagnostic + eventLog.toString();
-        if (logView != null) {
-            logView.setText(lastDiagnostic);
-        }
-    }
-
-    private boolean containsDji(String value) {
-        return value != null && value.toLowerCase(Locale.ROOT).contains("dji");
-    }
-
-    private String callManufacturer(UsbDevice d) {
-        try {
-            return d.getManufacturerName();
-        } catch (Throwable t) {
-            return "indisponível";
-        }
-    }
-
-    private String callProduct(UsbDevice d) {
-        try {
-            return d.getProductName();
-        } catch (Throwable t) {
-            return "indisponível";
-        }
-    }
-
-    @SuppressWarnings("deprecation")
-    private UsbDevice getUsbDeviceExtra(Intent intent) {
-        if (Build.VERSION.SDK_INT >= 33) {
-            return intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice.class);
-        }
-        return (UsbDevice) intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
-    }
-
-    @SuppressWarnings("deprecation")
-    private UsbAccessory getUsbAccessoryExtra(Intent intent) {
-        if (Build.VERSION.SDK_INT >= 33) {
-            return intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY, UsbAccessory.class);
-        }
-        return (UsbAccessory) intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY);
-    }
-
-    private String toHex(byte[] data) {
-        StringBuilder sb = new StringBuilder();
-        int limit = Math.min(data.length, 1024);
-        for (int i = 0; i < limit; i++) {
-            if (i > 0) sb.append(' ');
-            sb.append(String.format(Locale.US, "%02X", data[i] & 0xFF));
-        }
-        if (data.length > limit) {
-            sb.append(" ... (+").append(data.length - limit).append(" bytes)");
-        }
-        return sb.toString();
-    }
-
-    private String toAscii(byte[] data) {
-        StringBuilder sb = new StringBuilder();
-        int limit = Math.min(data.length, 512);
-        for (int i = 0; i < limit; i++) {
-            int b = data[i] & 0xFF;
-            if (b >= 32 && b <= 126) {
-                sb.append((char) b);
-            } else {
-                sb.append('.');
-            }
-        }
-        if (data.length > limit) {
-            sb.append("...");
-        }
-        return sb.toString();
-    }
-
-    private String safe(String s) {
-        return s == null ? "-" : s;
-    }
-
-    private String hex4(int value) {
-        return String.format(Locale.US, "%04X", value & 0xFFFF);
+                | ((data[offset + 1] & 0xFF) << 8);
     }
 
     private int dp(int value) {
-        float density = getResources().getDisplayMetrics().density;
-        return Math.round(value * density);
+        return Math.round(
+                value * getResources().getDisplayMetrics().density);
+    }
+
+    private String safe(String value) {
+        return value == null ? "" : value;
+    }
+
+    private String formatBytes(long value) {
+        if (value < 1024) return value + " B";
+
+        double kb = value / 1024.0;
+        if (kb < 1024) {
+            return String.format(Locale.US, "%.1f KB", kb);
+        }
+
+        return String.format(
+                Locale.US,
+                "%.2f MB",
+                kb / 1024.0);
     }
 }
