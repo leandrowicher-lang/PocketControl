@@ -156,7 +156,7 @@ public class MainActivity extends Activity {
         root.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("Pocket Control 0.4");
+        title.setText("Pocket Control 0.5");
         title.setTextSize(24f);
         title.setGravity(Gravity.CENTER_HORIZONTAL);
         root.addView(title, new LinearLayout.LayoutParams(
@@ -246,7 +246,7 @@ public class MainActivity extends Activity {
             }
 
             StringBuilder out = new StringBuilder();
-            out.append("Pocket Control 0.4\n");
+            out.append("Pocket Control 0.5\n");
             out.append("Android: ").append(Build.VERSION.RELEASE)
                     .append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
             out.append("Aparelho: ").append(Build.MANUFACTURER)
@@ -552,18 +552,54 @@ public class MainActivity extends Activity {
         int frameCount = 0;
         int pos = 0;
 
+        // CAMERA 0x80 - Camera State Info
         boolean haveCameraState = false;
         int cameraFlags = 0;
         int cameraMode = -1;
         int cameraRecordState = -1;
+        int cameraPhotoState = -1;
+        boolean cameraConnected = false;
+        boolean cameraUsbState = false;
+        boolean cameraTimeSynced = false;
         boolean cameraSdInserted = false;
         int cameraSdState = -1;
+        long cameraSdTotal = -1;
+        long cameraSdFree = -1;
+        long cameraRemainingShots = -1;
+        long cameraRemainingTime = -1;
+        int cameraRecordTime = -1;
+        boolean cameraHistogramEnabled = false;
+        int cameraType = -1;
+        int cameraStateVersion = -1;
 
+        // CAMERA 0x81 - Camera Shot Params
+        boolean haveShotParams = false;
+        int apertureRaw = -1;
+        int shutterRaw = -1;
+        int shutterDecimal = -1;
+        int isoCode = -1;
+        int exposureCompRaw = -1;
+        int imageRatioCode = -1;
+        int videoFormatCode = -1;
+        int videoFpsCode = -1;
+        int videoFovCode = -1;
+        int exposureModeCode = -1;
+        int whiteBalanceCode = -1;
+        int colorTempCode = -1;
+        int antiFlickerCode = -1;
+
+        // GIMBAL 0x05 - Gimbal Params / Push Position
         boolean haveGimbal = false;
         double gimbalPitch = 0.0;
         double gimbalRoll = 0.0;
         double gimbalYaw = 0.0;
         int gimbalMode = -1;
+        boolean gimbalPitchLimit = false;
+        boolean gimbalRollLimit = false;
+        boolean gimbalYawLimit = false;
+        boolean gimbalCalibrating = false;
+        boolean gimbalStuck = false;
+        int gimbalVersion = -1;
 
         while (pos + 8 <= data.length) {
             if (!looksLikePocketTransportHeader(data, pos)) {
@@ -621,17 +657,57 @@ public class MainActivity extends Activity {
                 Integer oldCount = commandCounts.get(key);
                 commandCounts.put(key, oldCount == null ? 1 : oldCount + 1);
 
-                // Camera State Info / status push.
+                // Camera State Info (0x80)
                 if (cmdSet == 0x02 && cmdId == 0x80 && innerPayloadLength >= 5) {
                     cameraFlags = readLe32Int(data, innerPayloadStart);
                     cameraMode = data[innerPayloadStart + 4] & 0xFF;
+
+                    cameraConnected = (cameraFlags & 0x0001) != 0;
+                    cameraUsbState = (cameraFlags & 0x0002) != 0;
+                    cameraTimeSynced = (cameraFlags & 0x0004) != 0;
+                    cameraPhotoState = (cameraFlags >> 3) & 0x07;
                     cameraRecordState = (cameraFlags >> 6) & 0x03;
                     cameraSdInserted = (cameraFlags & 0x0200) != 0;
                     cameraSdState = (cameraFlags >> 10) & 0x0F;
+
+                    if (innerPayloadLength >= 37) {
+                        cameraSdTotal = readLe32Unsigned(data, innerPayloadStart + 5);
+                        cameraSdFree = readLe32Unsigned(data, innerPayloadStart + 9);
+                        cameraRemainingShots = readLe32Unsigned(data, innerPayloadStart + 13);
+                        cameraRemainingTime = readLe32Unsigned(data, innerPayloadStart + 17);
+                        cameraRecordTime = readLe16Unsigned(data, innerPayloadStart + 29);
+                        cameraHistogramEnabled =
+                                (data[innerPayloadStart + 32] & 0x01) != 0;
+                        cameraType = data[innerPayloadStart + 33] & 0xFF;
+                        cameraStateVersion = data[innerPayloadStart + 36] & 0xFF;
+                    }
+
                     haveCameraState = true;
                 }
 
-                // Gimbal Params / push position.
+                // Camera Shot Params (0x81)
+                if (cmdSet == 0x02 && cmdId == 0x81 && innerPayloadLength >= 25) {
+                    apertureRaw = readLe16Unsigned(data, innerPayloadStart);
+                    shutterRaw = readLe16Unsigned(data, innerPayloadStart + 2);
+                    shutterDecimal = data[innerPayloadStart + 4] & 0xFF;
+                    isoCode = data[innerPayloadStart + 5] & 0xFF;
+                    exposureCompRaw = data[innerPayloadStart + 6] & 0xFF;
+                    imageRatioCode = data[innerPayloadStart + 10] & 0xFF;
+                    videoFormatCode = data[innerPayloadStart + 13] & 0xFF;
+                    videoFpsCode = data[innerPayloadStart + 14] & 0xFF;
+                    videoFovCode = data[innerPayloadStart + 15] & 0xFF;
+                    exposureModeCode = data[innerPayloadStart + 20] & 0xFF;
+                    whiteBalanceCode = data[innerPayloadStart + 23] & 0xFF;
+                    colorTempCode = data[innerPayloadStart + 24] & 0xFF;
+
+                    if (innerPayloadLength >= 34) {
+                        antiFlickerCode = data[innerPayloadStart + 33] & 0xFF;
+                    }
+
+                    haveShotParams = true;
+                }
+
+                // Gimbal Params / Push Position (0x05)
                 if (cmdSet == 0x04 && cmdId == 0x05 && innerPayloadLength >= 7) {
                     int pitchRaw = readLe16Signed(data, innerPayloadStart);
                     int rollRaw = readLe16Signed(data, innerPayloadStart + 2);
@@ -642,6 +718,19 @@ public class MainActivity extends Activity {
                     gimbalRoll = rollRaw / 10.0;
                     gimbalYaw = yawRaw / 10.0;
                     gimbalMode = (modeByte >> 6) & 0x03;
+
+                    if (innerPayloadLength >= 12) {
+                        int flags10 = data[innerPayloadStart + 10] & 0xFF;
+                        int flags11 = data[innerPayloadStart + 11] & 0xFF;
+
+                        gimbalPitchLimit = (flags10 & 0x01) != 0;
+                        gimbalRollLimit = (flags10 & 0x02) != 0;
+                        gimbalYawLimit = (flags10 & 0x04) != 0;
+                        gimbalCalibrating = (flags10 & 0x08) != 0;
+                        gimbalStuck = (flags10 & 0x40) != 0;
+                        gimbalVersion = flags11 & 0x0F;
+                    }
+
                     haveGimbal = true;
                 }
 
@@ -657,33 +746,82 @@ public class MainActivity extends Activity {
 
         StringBuilder out = new StringBuilder();
         out.append("Total capturado: ").append(data.length).append(" bytes\n");
-        out.append("Blocos USB DJI completos/parciais encontrados: ")
-                .append(outerCount).append("\n");
-        out.append("Quadros DUML completos encontrados: ")
-                .append(frameCount).append("\n\n");
+        out.append("Blocos USB DJI encontrados: ").append(outerCount).append("\n");
+        out.append("Quadros DUML completos: ").append(frameCount).append("\n\n");
 
         if (haveCameraState) {
-            out.append("=== ESTADO DA CÂMERA ===\n");
+            out.append("=== CÂMERA ===\n");
             out.append("Modo: ").append(cameraModeName(cameraMode))
                     .append(" (").append(cameraMode).append(")\n");
-            out.append("Estado de gravação (bits): ")
-                    .append(cameraRecordState).append("\n");
-            out.append("Cartão SD detectado: ")
-                    .append(cameraSdInserted ? "SIM" : "NÃO").append("\n");
-            out.append("Estado SD (valor): ")
-                    .append(cameraSdState).append("\n");
-            out.append("Flags brutas: 0x")
+            out.append("Conectada: ").append(cameraConnected ? "SIM" : "NÃO").append("\n");
+            out.append("USB ativo: ").append(cameraUsbState ? "SIM" : "NÃO").append("\n");
+            out.append("Hora sincronizada: ").append(cameraTimeSynced ? "SIM" : "NÃO").append("\n");
+            out.append("Estado de foto: ").append(photoStateName(cameraPhotoState))
+                    .append(" (").append(cameraPhotoState).append(")\n");
+            out.append("Estado de gravação: ").append(recordStateName(cameraRecordState))
+                    .append(" (").append(cameraRecordState).append(")\n");
+            out.append("Cartão SD inserido: ").append(cameraSdInserted ? "SIM" : "NÃO").append("\n");
+            out.append("Estado SD: ").append(sdStateName(cameraSdState))
+                    .append(" (").append(cameraSdState).append(")\n");
+
+            if (cameraSdTotal >= 0) {
+                out.append("SD total (valor bruto): ").append(cameraSdTotal).append("\n");
+                out.append("SD livre (valor bruto): ").append(cameraSdFree).append("\n");
+                out.append("Fotos restantes: ").append(cameraRemainingShots).append("\n");
+                out.append("Tempo restante (valor bruto): ").append(cameraRemainingTime).append("\n");
+                out.append("Tempo de gravação atual: ").append(cameraRecordTime).append("\n");
+                out.append("Histograma ativo: ")
+                        .append(cameraHistogramEnabled ? "SIM" : "NÃO").append("\n");
+                out.append("Tipo de câmera (código): 0x").append(hex2(cameraType)).append("\n");
+                out.append("Versão do estado: ").append(cameraStateVersion).append("\n");
+            }
+
+            out.append("Flags: 0x")
                     .append(String.format(Locale.US, "%08X", cameraFlags))
                     .append("\n\n");
         }
 
+        if (haveShotParams) {
+            out.append("=== AJUSTES DE CAPTURA ===\n");
+            out.append("ISO: ").append(isoName(isoCode))
+                    .append(" (código ").append(isoCode).append(")\n");
+            out.append("Exposição: ").append(exposureModeName(exposureModeCode))
+                    .append(" (código ").append(exposureModeCode).append(")\n");
+            out.append("Obturador bruto: 0x")
+                    .append(String.format(Locale.US, "%04X", shutterRaw))
+                    .append(" / decimal ").append(shutterDecimal).append("\n");
+            out.append("Abertura bruta: 0x")
+                    .append(String.format(Locale.US, "%04X", apertureRaw)).append("\n");
+            out.append("Compensação EV (código bruto): ").append(exposureCompRaw).append("\n");
+            out.append("Proporção da foto: ").append(imageRatioName(imageRatioCode))
+                    .append(" (").append(imageRatioCode).append(")\n");
+            out.append("Formato de vídeo (código): ").append(videoFormatCode).append("\n");
+            out.append("FPS de vídeo (código): ").append(videoFpsCode).append("\n");
+            out.append("FOV de vídeo (código): ").append(videoFovCode).append("\n");
+            out.append("Balanço de branco (código): ").append(whiteBalanceCode).append("\n");
+            out.append("Temperatura de cor (código): ").append(colorTempCode).append("\n");
+            if (antiFlickerCode >= 0) {
+                out.append("Anti-flicker (código): ").append(antiFlickerCode).append("\n");
+            }
+            out.append("\n");
+        }
+
         if (haveGimbal) {
-            out.append("=== ESTADO DO GIMBAL ===\n");
+            out.append("=== GIMBAL ===\n");
             out.append(String.format(Locale.US,
-                    "Pitch: %.1f° | Roll: %.1f° | Yaw: %.1f°\n",
+                    "Pitch bruto: %.1f° | Roll bruto: %.1f° | Yaw bruto: %.1f°\n",
                     gimbalPitch, gimbalRoll, gimbalYaw));
             out.append("Modo: ").append(gimbalModeName(gimbalMode))
-                    .append(" (").append(gimbalMode).append(")\n\n");
+                    .append(" (").append(gimbalMode).append(")\n");
+            out.append("Pitch no limite: ").append(gimbalPitchLimit ? "SIM" : "NÃO").append("\n");
+            out.append("Roll no limite: ").append(gimbalRollLimit ? "SIM" : "NÃO").append("\n");
+            out.append("Yaw no limite: ").append(gimbalYawLimit ? "SIM" : "NÃO").append("\n");
+            out.append("Calibrando: ").append(gimbalCalibrating ? "SIM" : "NÃO").append("\n");
+            out.append("Travado/stuck: ").append(gimbalStuck ? "SIM" : "NÃO").append("\n");
+            if (gimbalVersion >= 0) {
+                out.append("Versão do pacote do gimbal: ").append(gimbalVersion).append("\n");
+            }
+            out.append("Obs.: estes ângulos são coordenadas brutas do protocolo DJI.\n\n");
         }
 
         out.append("=== MENSAGENS OBSERVADAS ===\n");
@@ -692,8 +830,7 @@ public class MainActivity extends Activity {
                     .append(entry.getKey()).append("\n");
         }
 
-        out.append("\nNesta versão continuamos apenas lendo dados; ")
-                .append("nenhum comando é enviado à Osmo.");
+        out.append("\n0.5 ainda é somente leitura. Nenhum comando é enviado à Osmo.");
 
         return out.toString();
     }
@@ -704,6 +841,19 @@ public class MainActivity extends Activity {
                 | ((data[offset + 1] & 0xFF) << 8)
                 | ((data[offset + 2] & 0xFF) << 16)
                 | ((data[offset + 3] & 0xFF) << 24);
+    }
+
+    private long readLe32Unsigned(byte[] data, int offset) {
+        if (offset < 0 || offset + 4 > data.length) return -1;
+        return ((long) data[offset] & 0xFFL)
+                | (((long) data[offset + 1] & 0xFFL) << 8)
+                | (((long) data[offset + 2] & 0xFFL) << 16)
+                | (((long) data[offset + 3] & 0xFFL) << 24);
+    }
+
+    private int readLe16Unsigned(byte[] data, int offset) {
+        if (offset < 0 || offset + 2 > data.length) return 0;
+        return (data[offset] & 0xFF) | ((data[offset + 1] & 0xFF) << 8);
     }
 
     private int readLe16Signed(byte[] data, int offset) {
@@ -792,6 +942,87 @@ public class MainActivity extends Activity {
             case 6: return "DOWNLOAD";
             case 7: return "NOVO PLAYBACK";
             default: return "DESCONHECIDO";
+        }
+    }
+
+    private String photoStateName(int state) {
+        switch (state) {
+            case 0: return "Nenhuma captura";
+            case 1: return "Foto única";
+            case 2: return "Múltiplas";
+            case 3: return "HDR";
+            case 4: return "Panorama/FullView";
+            default: return "Outro";
+        }
+    }
+
+    private String recordStateName(int state) {
+        switch (state) {
+            case 0: return "Parada";
+            case 1: return "Estado 1";
+            case 2: return "Estado 2";
+            case 3: return "Estado 3";
+            default: return "Desconhecido";
+        }
+    }
+
+    private String sdStateName(int state) {
+        switch (state) {
+            case 0: return "Normal";
+            case 1: return "Sem cartão";
+            case 2: return "Inválido";
+            case 3: return "Protegido contra gravação";
+            case 4: return "Não formatado";
+            case 5: return "Formatando";
+            case 6: return "Ilegal/incompatível";
+            case 7: return "Ocupado";
+            case 8: return "Cheio";
+            case 9: return "Lento";
+            case 10: return "Desconhecido";
+            case 11: return "Índice máximo";
+            case 12: return "Inicializando";
+            case 13: return "Precisa formatar";
+            case 14: return "Tentando recuperar arquivo";
+            case 15: return "Ficou lento";
+            default: return "Estado " + state;
+        }
+    }
+
+    private String isoName(int code) {
+        switch (code) {
+            case 0: return "AUTO";
+            case 1: return "AUTO HIGH";
+            case 2: return "ISO 50";
+            case 3: return "ISO 100";
+            case 4: return "ISO 200";
+            case 5: return "ISO 400";
+            case 6: return "ISO 800";
+            case 7: return "ISO 1600";
+            case 8: return "ISO 3200";
+            case 9: return "ISO 6400";
+            case 10: return "ISO 12800";
+            case 11: return "ISO 25600";
+            default: return "Código " + code;
+        }
+    }
+
+    private String exposureModeName(int mode) {
+        switch (mode) {
+            case 1: return "Program";
+            case 2: return "Prioridade do obturador";
+            case 3: return "Prioridade de abertura";
+            case 4: return "Manual";
+            case 7: return "Cine";
+            default: return "Código " + mode;
+        }
+    }
+
+    private String imageRatioName(int code) {
+        switch (code) {
+            case 0: return "4:3";
+            case 1: return "16:9";
+            case 2: return "3:2";
+            default: return "Outro";
         }
     }
 
