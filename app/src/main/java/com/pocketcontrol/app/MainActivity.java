@@ -167,7 +167,7 @@ public class MainActivity extends Activity {
         root.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("Pocket Control 1.1 Video Mapper");
+        title.setText("Pocket Control 1.2 Raw Stream Sniffer");
         title.setTextSize(24f);
         title.setGravity(Gravity.CENTER_HORIZONTAL);
         root.addView(title, new LinearLayout.LayoutParams(
@@ -175,7 +175,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("Mapeando o canal real de vídeo da Osmo Pocket 1");
+        subtitle.setText("Analisando todo o stream USB, inclusive bytes fora do DUML");
         subtitle.setTextSize(15f);
         subtitle.setGravity(Gravity.CENTER_HORIZONTAL);
         subtitle.setPadding(0, dp(6), 0, dp(14));
@@ -288,7 +288,7 @@ public class MainActivity extends Activity {
             }
 
             StringBuilder out = new StringBuilder();
-            out.append("Pocket Control 1.1 Video Mapper\n");
+            out.append("Pocket Control 1.2 Raw Stream Sniffer\n");
             out.append("Android: ").append(Build.VERSION.RELEASE)
                     .append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
             out.append("Aparelho: ").append(Build.MANUFACTURER)
@@ -897,93 +897,210 @@ public class MainActivity extends Activity {
         int outerBlocks = 0;
         long totalOuterPayload = 0;
         long controlBytes = 0;
-        long unexplainedBytes = 0;
+        long rawBytes = 0;
         int maxOuterPayload = 0;
+        int rawSegments = 0;
+        int maxRawSegment = 0;
 
-        ByteArrayOutputStream unexplained = new ByteArrayOutputStream();
+        ByteArrayOutputStream raw = new ByteArrayOutputStream();
 
         int pos = 0;
-        while (pos + 8 <= data.length) {
-            if (!looksLikePocketTransportHeader(data, pos)) {
+        int rawRunStart = -1;
+
+        while (pos < data.length) {
+            boolean validOuter = false;
+
+            if (pos + 8 <= data.length && looksLikePocketTransportHeader(data, pos)) {
+                long lenLong = readLe32(data, pos + 4);
+
+                if (lenLong >= 0 && lenLong <= Integer.MAX_VALUE) {
+                    int len = (int) lenLong;
+                    int payloadStart = pos + 8;
+                    int payloadEnd = payloadStart + len;
+
+                    if (len >= 0 && payloadEnd <= data.length) {
+                        // Flush bytes that came before this valid 55 CC 49 57 block.
+                        if (rawRunStart >= 0 && rawRunStart < pos) {
+                            int n = pos - rawRunStart;
+                            raw.write(data, rawRunStart, n);
+                            rawBytes += n;
+                            rawSegments++;
+                            if (n > maxRawSegment) maxRawSegment = n;
+                            rawRunStart = -1;
+                        }
+
+                        validOuter = true;
+                        outerBlocks++;
+                        totalOuterPayload += len;
+                        if (len > maxOuterPayload) maxOuterPayload = len;
+
+                        int parsed = countContiguousDumlBytes(data, payloadStart, payloadEnd);
+                        controlBytes += parsed;
+
+                        // Anything inside the DJI outer block after the DUML sequence
+                        // is also raw/unclassified data.
+                        if (parsed < len) {
+                            int rawStart = payloadStart + parsed;
+                            int rawLen = payloadEnd - rawStart;
+
+                            if (rawLen > 0) {
+                                raw.write(data, rawStart, rawLen);
+                                rawBytes += rawLen;
+                                rawSegments++;
+                                if (rawLen > maxRawSegment) maxRawSegment = rawLen;
+                            }
+                        }
+
+                        pos = payloadEnd;
+                    }
+                }
+            }
+
+            if (!validOuter) {
+                if (rawRunStart < 0) rawRunStart = pos;
                 pos++;
-                continue;
             }
-
-            long lenLong = readLe32(data, pos + 4);
-            if (lenLong < 0 || lenLong > Integer.MAX_VALUE) {
-                pos++;
-                continue;
-            }
-
-            int len = (int) lenLong;
-            int payloadStart = pos + 8;
-            int payloadEnd = payloadStart + len;
-
-            if (payloadEnd > data.length) break;
-
-            outerBlocks++;
-            totalOuterPayload += len;
-            if (len > maxOuterPayload) maxOuterPayload = len;
-
-            int parsed = countContiguousDumlBytes(data, payloadStart, payloadEnd);
-
-            if (parsed > 0) {
-                controlBytes += parsed;
-            }
-
-            if (parsed < len) {
-                int rawStart = payloadStart + parsed;
-                int rawLen = payloadEnd - rawStart;
-                unexplainedBytes += rawLen;
-                unexplained.write(data, rawStart, rawLen);
-            }
-
-            pos = payloadEnd;
         }
 
-        byte[] raw = unexplained.toByteArray();
-        NalStats stats = scanAnnexBNals(raw);
+        // Flush any trailing bytes after the last known transport block.
+        if (rawRunStart >= 0 && rawRunStart < data.length) {
+            int n = data.length - rawRunStart;
+            raw.write(data, rawRunStart, n);
+            rawBytes += n;
+            rawSegments++;
+            if (n > maxRawSegment) maxRawSegment = n;
+        }
+
+        byte[] rawData = raw.toByteArray();
+        NalStats annexB = scanAnnexBNals(rawData);
+        NalStats avcc = scanAvccNals(rawData);
+
+        int jpegStarts = countPattern(rawData, new byte[]{(byte)0xFF, (byte)0xD8, (byte)0xFF});
+        int mpegTsSyncs = countMpegTsLikeSync(rawData);
 
         StringBuilder out = new StringBuilder();
-        out.append("Blocos 55 CC 49 57: ").append(outerBlocks).append("\\n");
-        out.append("Payload total: ").append(totalOuterPayload).append(" bytes\\n");
-        out.append("Bytes reconhecidos como DUML: ").append(controlBytes).append("\\n");
-        out.append("Bytes fora do DUML: ").append(unexplainedBytes).append("\\n");
-        out.append("Maior payload externo: ").append(maxOuterPayload).append(" bytes\\n\\n");
+        out.append("Bytes totais capturados: ").append(data.length).append("\\n");
+        out.append("Blocos 55 CC 49 57 válidos: ").append(outerBlocks).append("\\n");
+        out.append("Payload total desses blocos: ").append(totalOuterPayload).append(" bytes\\n");
+        out.append("Bytes DUML reconhecidos: ").append(controlBytes).append("\\n");
+        out.append("Bytes RAW/não classificados: ").append(rawBytes).append("\\n");
+        out.append("Segmentos RAW: ").append(rawSegments)
+                .append(" | maior segmento RAW: ").append(maxRawSegment).append(" bytes\\n");
+        out.append("Maior payload 55 CC: ").append(maxOuterPayload).append(" bytes\\n\\n");
 
-        if (unexplainedBytes == 0) {
-            out.append("RESULTADO: todo o tráfego observado é controle DUML. ")
-                    .append("Nenhum fluxo de vídeo bruto apareceu neste canal.\\n");
+        out.append("=== H.264 ANNEX-B NOS BYTES RAW ===\\n");
+        out.append(formatNalStats(annexB)).append("\\n\\n");
+
+        out.append("=== H.264 AVCC/LENGTH-PREFIXED NOS BYTES RAW ===\\n");
+        out.append(formatNalStats(avcc)).append("\\n\\n");
+
+        out.append("JPEG SOI encontrados: ").append(jpegStarts).append("\\n");
+        out.append("Possíveis sync bytes MPEG-TS: ").append(mpegTsSyncs).append("\\n\\n");
+
+        boolean strongAnnexB = annexB.sps > 0 && annexB.pps > 0 && annexB.idr > 0;
+        boolean strongAvcc = avcc.sps > 0 && avcc.pps > 0 && avcc.idr > 0;
+
+        if (strongAnnexB || strongAvcc) {
+            out.append("RESULTADO: forte evidência de fluxo H.264 decodificável no mesmo descritor USB.\\n");
+        } else if (rawBytes > 0) {
+            out.append("RESULTADO: existem bytes fora do canal DUML, mas ainda não formam um H.264 completo ")
+                    .append("(SPS+PPS+IDR). Precisamos identificar o framing desses segmentos.\\n");
         } else {
-            out.append("NAL H.264 somente nos bytes FORA do DUML:\\n");
-            out.append("Start codes=").append(stats.startCodes)
-                    .append(" | SPS=").append(stats.sps)
-                    .append(" | PPS=").append(stats.pps)
-                    .append(" | IDR=").append(stats.idr)
-                    .append(" | non-IDR=").append(stats.nonIdr)
-                    .append(" | SEI=").append(stats.sei)
-                    .append(" | outros=").append(stats.other)
-                    .append("\\n");
-
-            if (stats.sps > 0 && stats.pps > 0 && stats.idr > 0) {
-                out.append("RESULTADO: há forte evidência de H.264 decodificável neste canal.\\n");
-            } else {
-                out.append("RESULTADO: ainda não há conjunto SPS+PPS+IDR suficiente ")
-                        .append("para considerar isto um Live View H.264 válido.\\n");
-            }
-
-            int preview = Math.min(raw.length, 96);
-            if (preview > 0) {
-                byte[] p = new byte[preview];
-                System.arraycopy(raw, 0, p, 0, preview);
-                out.append("Primeiros bytes não-DUML: ").append(toHex(p)).append("\\n");
-            }
+            out.append("RESULTADO: neste intervalo, TODO byte recebido pertenceu a blocos DJI/DUML. ")
+                    .append("O Live View provavelmente usa outra sessão/canal ou só começa após uma sequência de inicialização específica.\\n");
         }
 
-        out.append("\\nObservação: o scanner antigo procurava 00 00 01 no tráfego inteiro ")
-                .append("e podia contar falsos positivos dentro de mensagens de controle.");
+        if (rawData.length > 0) {
+            int preview = Math.min(rawData.length, 160);
+            byte[] p = new byte[preview];
+            System.arraycopy(rawData, 0, p, 0, preview);
+            out.append("\\nPrimeiros ").append(preview)
+                    .append(" bytes RAW:\\n").append(toHex(p)).append("\\n");
+        }
+
+        out.append("\\nCorreção da 1.2: agora bytes ANTES, ENTRE e DEPOIS dos blocos 55 CC também entram na análise.");
 
         return out.toString();
+    }
+
+    private String formatNalStats(NalStats s) {
+        return "Start/frames=" + s.startCodes
+                + " | SPS=" + s.sps
+                + " | PPS=" + s.pps
+                + " | IDR=" + s.idr
+                + " | non-IDR=" + s.nonIdr
+                + " | SEI=" + s.sei
+                + " | outros=" + s.other;
+    }
+
+    private NalStats scanAvccNals(byte[] data) {
+        NalStats s = new NalStats();
+        if (data == null || data.length < 5) return s;
+
+        int i = 0;
+        while (i + 5 <= data.length) {
+            int len = ((data[i] & 0xFF) << 24)
+                    | ((data[i + 1] & 0xFF) << 16)
+                    | ((data[i + 2] & 0xFF) << 8)
+                    | (data[i + 3] & 0xFF);
+
+            if (len > 0 && len <= data.length - (i + 4)) {
+                int type = data[i + 4] & 0x1F;
+
+                // Restrict to plausible H.264 NAL types to avoid random binary false positives.
+                if (type == 1 || type == 5 || type == 6 || type == 7 || type == 8) {
+                    s.startCodes++;
+
+                    switch (type) {
+                        case 1: s.nonIdr++; break;
+                        case 5: s.idr++; break;
+                        case 6: s.sei++; break;
+                        case 7: s.sps++; break;
+                        case 8: s.pps++; break;
+                        default: s.other++; break;
+                    }
+
+                    i += 4 + len;
+                    continue;
+                }
+            }
+
+            i++;
+        }
+
+        return s;
+    }
+
+    private int countPattern(byte[] data, byte[] pattern) {
+        if (data == null || pattern == null || pattern.length == 0) return 0;
+        int count = 0;
+
+        for (int i = 0; i + pattern.length <= data.length; i++) {
+            boolean same = true;
+            for (int j = 0; j < pattern.length; j++) {
+                if (data[i + j] != pattern[j]) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) count++;
+        }
+
+        return count;
+    }
+
+    private int countMpegTsLikeSync(byte[] data) {
+        if (data == null || data.length < 188 * 3) return 0;
+
+        int hits = 0;
+        for (int i = 0; i < 188 && i < data.length; i++) {
+            int local = 0;
+            for (int p = i; p < data.length; p += 188) {
+                if ((data[p] & 0xFF) == 0x47) local++;
+            }
+            if (local > hits) hits = local;
+        }
+        return hits;
     }
 
     private int countContiguousDumlBytes(byte[] data, int start, int end) {
