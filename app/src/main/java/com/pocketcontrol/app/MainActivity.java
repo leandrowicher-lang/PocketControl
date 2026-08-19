@@ -28,6 +28,7 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.ByteArrayOutputStream;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -54,6 +55,7 @@ public class MainActivity extends Activity {
     private FileOutputStream accessoryOutput;
     private volatile boolean listening = false;
     private Thread listenThread;
+    private final ByteArrayOutputStream captureBuffer = new ByteArrayOutputStream();
 
     private final BroadcastReceiver usbPermissionReceiver = new BroadcastReceiver() {
         @Override
@@ -154,7 +156,7 @@ public class MainActivity extends Activity {
         root.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("Pocket Control 0.2");
+        title.setText("Pocket Control 0.3");
         title.setTextSize(24f);
         title.setGravity(Gravity.CENTER_HORIZONTAL);
         root.addView(title, new LinearLayout.LayoutParams(
@@ -244,7 +246,7 @@ public class MainActivity extends Activity {
             }
 
             StringBuilder out = new StringBuilder();
-            out.append("Pocket Control 0.2\n");
+            out.append("Pocket Control 0.3\n");
             out.append("Android: ").append(Build.VERSION.RELEASE)
                     .append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
             out.append("Aparelho: ").append(Build.MANUFACTURER)
@@ -456,6 +458,7 @@ public class MainActivity extends Activity {
         }
 
         listening = true;
+        captureBuffer.reset();
         appendEvent("Escuta passiva iniciada por 10 segundos. Não enviaremos comandos.");
         statusView.setText("👂 Escutando a Osmo por 10 s...");
 
@@ -489,6 +492,7 @@ public class MainActivity extends Activity {
                             chunks++;
                             byte[] packet = new byte[count];
                             System.arraycopy(buffer, 0, packet, 0, count);
+                            captureBuffer.write(packet, 0, packet.length);
                             appendEventFromWorker("RX #" + chunks + " — " + count
                                     + " bytes\nHEX: " + toHex(packet)
                                     + "\nASCII: " + toAscii(packet));
@@ -509,9 +513,12 @@ public class MainActivity extends Activity {
                 listening = false;
                 final int bytes = total;
                 final int packetCount = chunks;
+                final byte[] captured = captureBuffer.toByteArray();
+                final String automaticAnalysis = analyzeCapture(captured);
                 runOnUiThread(() -> {
                     appendEvent("Escuta finalizada: " + bytes + " bytes em "
                             + packetCount + " bloco(s).");
+                    appendEvent("ANÁLISE AUTOMÁTICA DA CAPTURA\n" + automaticAnalysis);
                     if (bytes == 0) {
                         appendEvent("Zero bytes não significa falha: a Pocket pode esperar "
                                 + "um comando de protocolo antes de responder.");
@@ -533,6 +540,194 @@ public class MainActivity extends Activity {
         if (t != null) {
             t.interrupt();
         }
+    }
+
+
+    private String analyzeCapture(byte[] data) {
+        StringBuilder out = new StringBuilder();
+
+        if (data == null || data.length == 0) {
+            return "Nenhum byte disponível para análise.";
+        }
+
+        out.append("Total capturado: ").append(data.length).append(" bytes\n");
+        out.append("Primeiros bytes: ")
+                .append(toHexRange(data, 0, Math.min(data.length, 96)))
+                .append("\n\n");
+
+        int outerCount = 0;
+        int parsedFrames = 0;
+        int pos = 0;
+
+        while (pos + 8 <= data.length) {
+            if (looksLikePocketTransportHeader(data, pos)) {
+                long payloadLengthLong = readLe32(data, pos + 4);
+                if (payloadLengthLong < 0 || payloadLengthLong > Integer.MAX_VALUE) {
+                    out.append("Bloco externo inválido em offset ").append(pos)
+                            .append(": tamanho fora do intervalo.\n");
+                    pos++;
+                    continue;
+                }
+
+                int payloadLength = (int) payloadLengthLong;
+                int payloadStart = pos + 8;
+                int available = data.length - payloadStart;
+
+                outerCount++;
+                out.append("BLOCO EXTERNO #").append(outerCount)
+                        .append(" offset=").append(pos)
+                        .append(" magic=55 CC 49 57")
+                        .append(" payload=").append(payloadLength)
+                        .append(" bytes");
+
+                if (payloadLength > available) {
+                    out.append(" — INCOMPLETO; disponíveis ")
+                            .append(available).append("\n");
+                    parsedFrames += parseDumlFrames(
+                            data, payloadStart, data.length, out, outerCount);
+                    break;
+                } else {
+                    out.append(" — COMPLETO\n");
+                    parsedFrames += parseDumlFrames(
+                            data, payloadStart, payloadStart + payloadLength, out, outerCount);
+                    pos = payloadStart + payloadLength;
+                    continue;
+                }
+            }
+            pos++;
+        }
+
+        if (outerCount == 0) {
+            out.append("Nenhum cabeçalho externo 55 CC 49 57 encontrado; ")
+                    .append("tentando localizar quadros 0x55 diretamente.\n");
+            parsedFrames += parseDumlFrames(data, 0, data.length, out, 0);
+        }
+
+        out.append("\nResumo: ")
+                .append(outerCount).append(" bloco(s) externo(s), ")
+                .append(parsedFrames).append(" quadro(s) candidato(s) DJI.\n");
+
+        out.append("Observação: nesta versão apenas analisamos os bytes recebidos; ")
+                .append("nenhum comando é enviado à câmera.");
+
+        return out.toString();
+    }
+
+    private int parseDumlFrames(
+            byte[] data, int start, int end, StringBuilder out, int outerIndex) {
+
+        int count = 0;
+        int p = start;
+
+        while (p + 4 <= end) {
+            if ((data[p] & 0xFF) != 0x55) {
+                p++;
+                continue;
+            }
+
+            int b1 = data[p + 1] & 0xFF;
+            int b2 = data[p + 2] & 0xFF;
+
+            // Estrutura observada nos quadros DJI:
+            // byte 1 = 8 bits baixos do tamanho
+            // bits 0..1 do byte 2 = 2 bits altos do tamanho
+            // bits 2..7 do byte 2 = versão
+            int frameLength = b1 | ((b2 & 0x03) << 8);
+            int version = (b2 >> 2) & 0x3F;
+
+            if (frameLength < 13 || frameLength > 1023) {
+                p++;
+                continue;
+            }
+
+            if (p + frameLength > end) {
+                out.append("  Quadro candidato em offset ").append(p)
+                        .append(" len=").append(frameLength)
+                        .append(" ver=").append(version)
+                        .append(" — incompleto neste bloco\n");
+                break;
+            }
+
+            count++;
+
+            int sender = data[p + 4] & 0xFF;
+            int receiver = data[p + 5] & 0xFF;
+            int sequence = (data[p + 6] & 0xFF) | ((data[p + 7] & 0xFF) << 8);
+            int flags = data[p + 8] & 0xFF;
+            int cmdSet = data[p + 9] & 0xFF;
+            int cmdId = data[p + 10] & 0xFF;
+            int payloadLength = frameLength - 13;
+
+            out.append("  FRAME #").append(count);
+            if (outerIndex > 0) {
+                out.append(" [bloco ").append(outerIndex).append("]");
+            }
+            out.append(" offset=").append(p)
+                    .append(" len=").append(frameLength)
+                    .append(" ver=").append(version)
+                    .append(" hdrCRC=0x").append(hex2(data[p + 3] & 0xFF))
+                    .append(" src=0x").append(hex2(sender))
+                    .append(" dst=0x").append(hex2(receiver))
+                    .append(" seq=").append(sequence)
+                    .append(" flags=0x").append(hex2(flags))
+                    .append(" cmdSet=0x").append(hex2(cmdSet))
+                    .append(" cmdId=0x").append(hex2(cmdId))
+                    .append(" payload=").append(payloadLength)
+                    .append(" bytes\n");
+
+            if (payloadLength > 0) {
+                int payloadStart = p + 11;
+                int previewLength = Math.min(payloadLength, 32);
+                out.append("    Payload: ")
+                        .append(toHexRange(data, payloadStart, previewLength));
+                if (payloadLength > previewLength) {
+                    out.append(" ... (+")
+                            .append(payloadLength - previewLength)
+                            .append(" bytes)");
+                }
+                out.append("\n");
+            }
+
+            p += frameLength;
+        }
+
+        return count;
+    }
+
+    private boolean looksLikePocketTransportHeader(byte[] data, int offset) {
+        return offset + 8 <= data.length
+                && (data[offset] & 0xFF) == 0x55
+                && (data[offset + 1] & 0xFF) == 0xCC
+                && (data[offset + 2] & 0xFF) == 0x49
+                && (data[offset + 3] & 0xFF) == 0x57;
+    }
+
+    private long readLe32(byte[] data, int offset) {
+        if (offset < 0 || offset + 4 > data.length) {
+            return -1;
+        }
+        return ((long) data[offset] & 0xFFL)
+                | (((long) data[offset + 1] & 0xFFL) << 8)
+                | (((long) data[offset + 2] & 0xFFL) << 16)
+                | (((long) data[offset + 3] & 0xFFL) << 24);
+    }
+
+    private String toHexRange(byte[] data, int offset, int length) {
+        if (data == null || offset < 0 || length <= 0 || offset >= data.length) {
+            return "";
+        }
+
+        int end = Math.min(data.length, offset + length);
+        StringBuilder sb = new StringBuilder();
+        for (int i = offset; i < end; i++) {
+            if (i > offset) sb.append(' ');
+            sb.append(String.format(Locale.US, "%02X", data[i] & 0xFF));
+        }
+        return sb.toString();
+    }
+
+    private String hex2(int value) {
+        return String.format(Locale.US, "%02X", value & 0xFF);
     }
 
     private String describeDeviceStructure(UsbDevice d) {
